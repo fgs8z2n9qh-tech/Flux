@@ -1,0 +1,16 @@
+# build output
+build/
+dist/
+__pycache__/
+*.spec
+
+# runtime files the app writes next to itself
+vrameter_config.json
+vrameter_log.csv
+vram_snapshot_*.txt
+
+# scratch
+window_shot.png
+shot_*.png
+concept_*.png
+check_*.png
