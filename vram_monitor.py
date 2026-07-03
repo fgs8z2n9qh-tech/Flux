@@ -721,7 +721,7 @@ class App:
         self._resize_after = None
         self._last_paint = 0.0
         self._peak = 0
-        self._proc_peak = {}
+        self._ever_visible = False       # window has been shown at least once
         self._proc_hist = {}             # name -> deque of recent bytes (growth)
         self._growing = set()            # names whose VRAM keeps climbing
         self._cache_since = None
@@ -1535,17 +1535,22 @@ class App:
         self.hist_vram.append(pct)
         self.hist_gpu.append(data["gpu"])
 
-        # GPU sensors (temp/clocks/power) — 15 ms read, every other tick
-        if self.sensors.ok and self._tickn % 2 == 0:
+        # Is the UI actually on screen? Skip the expensive repaint (and needless
+        # sensor reads) while minimised/hidden — this app runs in the background.
+        vis = self._mini_on or bool(self.root.winfo_viewable())
+        if vis:
+            self._ever_visible = True
+        log_now = self._tickn % LOG_EVERY == 1
+
+        # GPU sensors (temp/clocks/power) — a ~15 ms LHM read; only when they'll
+        # be shown or logged soon, and only every 3rd tick (they change slowly).
+        if self.sensors.ok and (vis or log_now) and self._tickn % 3 == 0:
             self.sensors_data = self.sensors.read()
         self.hist_temp.append(self.sensors_data.get("temp", 0) or 0)
 
-        # session peak (overall + per-process, for the log)
+        # session peak
         if used > self._peak:
             self._peak = used
-        for nm, val, _ in data.get("procs", []):
-            if val > self._proc_peak.get(nm, 0):
-                self._proc_peak[nm] = val
 
         # per-process growth detection (the live leak hunter)
         self._update_growth(data.get("procs", []))
@@ -1584,6 +1589,8 @@ class App:
         if self._mini_on:
             self._mini_paint(data)
             return
+        if self._ever_visible and not vis:
+            return                        # minimised / hidden — skip the repaint
         self.lbl_prochead.config(text=f"PROCESSES ({data.get('nproc', 0)})")
         self._paint_cards()
         self._draw_procs(data["procs"])
@@ -1643,8 +1650,26 @@ class App:
                         f"{gb(used):.2f},{pct:.0f},{gb(cached):.2f},"
                         f"{data.get('gpu', 0):.0f},"
                         f"{self.sensors_data.get('temp', '')},{top}\n")
+            self._trim_log()
         except Exception as exc:
             print("log error:", exc, file=sys.stderr)
+
+    def _trim_log(self):
+        """Keep the CSV from growing forever: cap it at ~20k rows (~2 weeks),
+        checked cheaply once every few hours."""
+        if self._tickn % (LOG_EVERY * 180) != 1:      # ~ every 3 hours
+            return
+        try:
+            if os.path.getsize(self._log_path) < 2_000_000:
+                return
+            with open(self._log_path, encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > 20000:
+                with open(self._log_path, "w", encoding="utf-8") as f:
+                    f.writelines(lines[:1])            # header
+                    f.writelines(lines[-20000:])
+        except Exception:
+            pass
 
     def _toast(self, text, color=ACCENT_WARN):
         try:
