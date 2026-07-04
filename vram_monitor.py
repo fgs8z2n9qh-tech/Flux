@@ -1267,6 +1267,7 @@ class App:
         self.scroll.pack(side="right", fill="y", padx=(5, 0))
         self._plist_w = 0
         self._proc_list = []          # (name, bytes, pids, critical) per row
+        self._xitems = []             # canvas id of each row's ✕ (for hover recolor)
         self._hover_i = -1
         self.plist.bind_all("<MouseWheel>", self._on_wheel)
         self.plist.bind("<Configure>", self._on_plist_config)
@@ -1535,7 +1536,8 @@ class App:
             return f"{val:.0f}%"
         if self._proc_mode == "net":
             return fmt_bits(val)
-        return f"{gb(val) * 1024:,.0f} MB"        # vram + ram both in MB
+        mb = gb(val) * 1024                        # vram + ram: GB once it's big
+        return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:,.0f} MB"
 
     def _pids_for_name(self, name):
         """All live pids whose exe base-name matches (for CPU/RAM kill, where the
@@ -2003,16 +2005,37 @@ class App:
     def _plist_motion(self, e):
         w = self.plist.winfo_width()
         i = self._plist_row_at(e)
-        over_x = (e.x >= w - 26 and 0 <= i < len(self._proc_list)
-                  and not self._proc_list[i][3])
+        valid = 0 <= i < len(self._proc_list)
+        over_x = valid and e.x >= w - 26 and not self._proc_list[i][3]
         self.plist.config(cursor="hand2" if over_x else "")
-        self._plist_hover(i if over_x else -1)
+        self._plist_hover(i if valid else -1)          # highlight the whole row
 
     def _plist_hover(self, i):
-        if i != self._hover_i:
-            self._hover_i = i
-            if self.last:
-                self._draw_procs()
+        # Update just the hover highlight + the two affected ✕ marks — a full
+        # _draw_procs() here cost ~14 ms per row-crossing on a long list.
+        if i == self._hover_i:
+            return
+        prev, self._hover_i = self._hover_i, i
+        c = self.plist
+        for idx in (prev, i):
+            if 0 <= idx < len(self._xitems):
+                crit = self._proc_list[idx][3]
+                c.itemconfig(self._xitems[idx], fill=(
+                    GRID if crit else
+                    ACCENT_HOT2 if idx == self._hover_i else ACCENT_HOT))
+        self._draw_hover_hl()
+
+    def _draw_hover_hl(self):
+        """Task-Manager-style highlight behind the hovered row."""
+        c = self.plist
+        c.delete("hl")
+        i = self._hover_i
+        if 0 <= i < len(self._proc_list):
+            w = c.winfo_width() or 380
+            y0 = i * self.ROWH
+            self._round_rect(c, 2, y0 + 1, w - 2, y0 + self.ROWH - 1, 6,
+                             fill=PANEL_HOVER, outline="", tags="hl")
+            c.tag_lower("hl")                          # sit behind the row items
 
     def _plist_click(self, e):
         if self._proc_mode == "net" and not self.net_etw.ok:
@@ -2065,6 +2088,7 @@ class App:
         if w < 60:
             w = 380
         self._proc_list = []
+        self._xitems = []
         if not procs:
             if mode == "net" and not self.net_etw.ok and not self.filter:
                 c.create_text(2, 14, anchor="w", fill=ACCENT_WARN,
@@ -2116,9 +2140,10 @@ class App:
                           fill=MUTED, font=self.f_mono)
             xcol = (GRID if crit else
                     ACCENT_HOT2 if i == self._hover_i else ACCENT_HOT)
-            c.create_text(xx, y, text="✕", anchor="e", fill=xcol,
-                          font=self.f_mid)
+            self._xitems.append(c.create_text(xx, y, text="✕", anchor="e",
+                                              fill=xcol, font=self.f_mid))
         c.configure(scrollregion=(0, 0, w, len(procs) * rh + 4))
+        self._draw_hover_hl()             # re-place the hover highlight (if any)
 
     # -- ending a process -------------------------------------------------- #
     def _kill(self, name, pids):
