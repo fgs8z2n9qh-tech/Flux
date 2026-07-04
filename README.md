@@ -1,10 +1,11 @@
-# VRAMeter
+# Flux
 
-A tiny GPU video-memory monitor for Windows. Shows how much VRAM is in use, out
-of your card's real capacity, with live graphs and which processes are using
-the memory — and lets you **end an app to free its VRAM** right from the list.
+**Flux** is a tiny GPU video-memory monitor for Windows. It shows how much VRAM
+is in use, out of your card's real capacity, with live graphs and which
+processes are using the memory — and lets you **end an app to free its VRAM**
+right from the list.
 
-![VRAMeter](screenshot.png)
+![Flux](screenshot.png)
 
 Built on an **AMD Radeon RX 9060 XT (16 GB)** but works for any AMD / NVIDIA /
 Intel GPU, because it reads the Windows WDDM GPU memory performance counters
@@ -12,7 +13,7 @@ rather than vendor-specific tools.
 
 ## Run it
 
-**Portable exe (no Python needed):** grab **`VRAMeter.exe`** from
+**Portable exe (no Python needed):** grab **`Flux.exe`** from
 [Releases](../../releases) — a single self-contained file, copy it anywhere,
 no install, no admin.
 
@@ -22,7 +23,7 @@ no install, no admin.
 python vram_monitor.py
 ```
 
-or double-click `Launch VRAMeter.vbs` (runs with no console window).
+or double-click `Launch Flux.vbs` (runs with no console window).
 
 **Dependencies** — the core (VRAM, GPU load, processes) is pure Python standard
 library (Tkinter + ctypes). The optional **GPU temperature / clocks** card uses
@@ -55,9 +56,9 @@ A frameless, custom-chrome window (drag the title bar; pin / minimise / maximise
 ### Leak hunting
 
 - **Background log** — appends a snapshot (VRAM, %, cached, GPU%, temp, top-5
-  processes) to `vrameter_log.csv` next to the app every minute.
+  processes) to `flux_log.csv` next to the app every minute.
 - **Auto-snapshot** — when VRAM suddenly jumps, the full process list is dumped
-  to `vram_snapshot_<time>.txt` to catch the culprit in the act.
+  to `flux_snapshot_<time>.txt` to catch the culprit in the act.
 - **Log viewer** — the history button (top bar) opens an in-app report: peak,
   biggest climbs, and recent samples — no spreadsheet needed.
 
@@ -76,11 +77,11 @@ Refreshes once per second (configurable).
 ```powershell
 # regenerate icon concepts to preview, then build the chosen one
 python icon_gen.py concepts
-python icon_gen.py build 1        # -> VRAMeter.ico + VRAMeter.png
+python icon_gen.py build 5        # -> Flux.ico + Flux.png  (concept 5 = flux)
 
 # build the portable exe (bundles pythonnet + the LibreHardwareMonitor DLLs)
-python -m PyInstaller --onefile --windowed --name VRAMeter --icon VRAMeter.ico `
-  --add-data "VRAMeter.ico;." `
+python -m PyInstaller --onefile --windowed --name Flux --icon Flux.ico `
+  --add-data "Flux.ico;." `
   --add-data "LibreHardwareMonitorLib.dll;." --add-data "System.Buffers.dll;." `
   --add-data "System.Memory.dll;." --add-data "System.Numerics.Vectors.dll;." `
   --add-data "System.Runtime.CompilerServices.Unsafe.dll;." `
@@ -96,7 +97,7 @@ python -m PyInstaller --onefile --windowed --name VRAMeter --icon VRAMeter.ico `
 | GPU load | PDH counter `\GPU Engine(*)\Utilization Percentage` (a *rate* counter — sampled across two refreshes) |
 | Per-process | PDH counter `\GPU Process Memory(*)\Dedicated Usage` (pid parsed → name) |
 | True capacity | registry `HardwareInformation.qwMemorySize` (WMI's `AdapterRAM` is capped at 4 GB and wrong) |
-| Process names | Toolhelp32 snapshot via `kernel32` |
+| Process names | Toolhelp32 snapshot via `kernel32` (cached — only re-read when the set of GPU processes changes) |
 | Ending a process | `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`, with a live name/critical re-check first |
 | Temp / clocks / power / fan | LibreHardwareMonitor via `pythonnet` (AMD GPU sensors, no admin) |
 

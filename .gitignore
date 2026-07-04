@@ -5,6 +5,10 @@ __pycache__/
 *.spec
 
 # runtime files the app writes next to itself
+flux_config.json
+flux_log.csv
+flux_snapshot_*.txt
+# legacy names (pre-rebrand), still ignored in case any linger
 vrameter_config.json
 vrameter_log.csv
 vram_snapshot_*.txt

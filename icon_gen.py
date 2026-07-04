@@ -1,13 +1,16 @@
-"""Generate icon concepts for VRAMeter and a multi-size .ico from the chosen one.
+"""Generate icon concepts for Flux and a multi-size .ico from the chosen one.
 
 Usage:
     python icon_gen.py concepts      # render concept_*.png at 256px to preview
-    python icon_gen.py build N       # build VRAMeter.ico from concept N (1..4)
+    python icon_gen.py build N       # build Flux.ico from concept N (1..5)
+
+Concept 5 (flux) is the shipped icon: a bold diagonal violet->pink->orange
+gradient with two flowing "memory in motion" wave lines.
 """
 import math
 import sys
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 SS = 4  # supersample factor for smooth edges
 
@@ -181,7 +184,54 @@ def concept_combo(size, frac=0.78):
     return img
 
 
-CONCEPTS = {1: concept_ring, 2: concept_bars, 3: concept_chip, 4: concept_combo}
+FLUX_A = (124, 58, 237)   # violet
+FLUX_B = (236, 72, 153)   # pink
+FLUX_C = (251, 146, 60)   # orange
+
+
+def _grad_flux(t):
+    """violet -> pink -> orange across t in [0,1]."""
+    if t < 0.5:
+        return lerp(FLUX_A, FLUX_B, t / 0.5)
+    return lerp(FLUX_B, FLUX_C, (t - 0.5) / 0.5)
+
+
+def concept_flux(size):
+    """Bold full-bleed diagonal gradient (violet->pink->orange) with two
+    flowing 'memory in motion' wave lines. The 'Flux' identity."""
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    grad = Image.new("RGBA", (size, size))
+    gd = grad.load()
+    for y in range(size):
+        for x in range(size):
+            gd[x, y] = _grad_flux((x + y) / (2 * size)) + (255,)
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        [0, 0, size - 1, size - 1], radius=int(size * 0.22), fill=255)
+    img.paste(grad, (0, 0), mask)
+
+    # flowing wave lines on a translucent overlay, then clipped to the corners
+    ov = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+    step = max(1, size // 90)
+
+    def wave(cy_frac, alpha):
+        cy = size * cy_frac
+        amp = size * 0.11
+        pts = [(x, cy + amp * math.sin((x / size) * 2 * math.pi * 1.6 + 0.6))
+               for x in range(0, size + 1, step)]
+        od.line(pts, fill=(255, 255, 255, alpha),
+                width=max(2, int(size * 0.033)), joint="curve")
+
+    wave(0.60, 130)
+    wave(0.42, 210)
+    img = Image.alpha_composite(img, ov)
+    img.putalpha(ImageChops.multiply(img.getchannel("A"), mask))
+    return img
+
+
+CONCEPTS = {1: concept_ring, 2: concept_bars, 3: concept_chip,
+            4: concept_combo, 5: concept_flux}
 
 
 def render(fn, size):
@@ -200,10 +250,10 @@ def main():
         fn = CONCEPTS[which]
         sizes = [256, 128, 64, 48, 32, 24, 16]
         imgs = [render(fn, s) for s in sizes]
-        imgs[0].save("VRAMeter.ico", sizes=[(s, s) for s in sizes],
+        imgs[0].save("Flux.ico", sizes=[(s, s) for s in sizes],
                      append_images=imgs[1:])
-        render(fn, 256).save("VRAMeter.png")
-        print(f"built VRAMeter.ico from concept {which}")
+        render(fn, 256).save("Flux.png")
+        print(f"built Flux.ico from concept {which}")
 
 
 if __name__ == "__main__":

@@ -562,6 +562,18 @@ def _app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _migrate_legacy_file(new_name, old_name):
+    """One-time rename of a legacy vrameter_* data file to its flux_* name, so
+    the rebrand keeps the user's settings and leak-log (never orphan them)."""
+    d = _app_dir()
+    new, old = os.path.join(d, new_name), os.path.join(d, old_name)
+    if os.path.exists(old) and not os.path.exists(new):
+        try:
+            os.replace(old, new)
+        except OSError:
+            pass
+
+
 class Config:
     """Tiny JSON settings store kept next to the app."""
     DEFAULTS = {"refresh_ms": 1000, "alert_pct": 90, "accent": "green",
@@ -569,7 +581,8 @@ class Config:
                 "mini_geometry": None}
 
     def __init__(self):
-        self.path = os.path.join(_app_dir(), "vrameter_config.json")
+        _migrate_legacy_file("flux_config.json", "vrameter_config.json")
+        self.path = os.path.join(_app_dir(), "flux_config.json")
         self.data = dict(self.DEFAULTS)
         try:
             with open(self.path, encoding="utf-8") as f:
@@ -748,11 +761,12 @@ class App:
         self._snap_cooldown = 0
         self._tickn = 0
         self._name_cache = {}            # pid -> exe name, for GPU-using pids
-        self._log_path = os.path.join(_app_dir(), "vrameter_log.csv")
+        _migrate_legacy_file("flux_log.csv", "vrameter_log.csv")
+        self._log_path = os.path.join(_app_dir(), "flux_log.csv")
 
         self.temp_on = self.sensors.ok and self.show_temp_pref
 
-        root.title("VRAMeter")
+        root.title("Flux")
         root.configure(bg=BG)
         cb = 248                              # top + VRAM + GPU-load cards
         if self.temp_on:
@@ -791,12 +805,14 @@ class App:
         tb = tk.Frame(root, bg=BG, height=40)
         tb.pack(fill="x", side="top")
         tb.pack_propagate(False)
-        logo = tk.Canvas(tb, width=20, height=20, bg=BG, highlightthickness=0)
+        # Flux mark: two flowing waves (echoes the app icon), in the accent hue
+        logo = tk.Canvas(tb, width=22, height=20, bg=BG, highlightthickness=0)
         logo.pack(side="left", padx=(14, 8))
-        logo.create_arc(2, 2, 17, 17, start=125, extent=290, style="arc",
-                        outline=ACCENT, width=2)
-        logo.create_oval(7, 7, 12, 12, fill=ACCENT, outline="")
-        title = tk.Label(tb, text="VRAMeter", bg=BG, fg=FG,
+        logo.create_line(1, 8, 6, 5, 11, 8, 16, 11, 21, 8,
+                         fill=GPU_LINE, width=2, smooth=True, capstyle="round")
+        logo.create_line(1, 13, 6, 10, 11, 13, 16, 16, 21, 13,
+                         fill=ACCENT, width=2, smooth=True, capstyle="round")
+        title = tk.Label(tb, text="Flux", bg=BG, fg=FG,
                          font=self.f_titlebar)
         title.pack(side="left")
         self._btn_close = self._winbtn(tb, "", self._close, close=True)
@@ -873,7 +889,7 @@ class App:
         # Compact mini-mode strip (own borderless top-most window, hidden) -- #
         self._mini_on = False
         self.mini = tk.Toplevel(root)
-        self.mini.title("VRAMeter mini")
+        self.mini.title("Flux mini")
         self.mini.withdraw()
         self.mini.overrideredirect(True)
         self.mini.attributes("-topmost", True)
@@ -1104,12 +1120,12 @@ class App:
             return
         t = tk.Toplevel(self.root)
         self._set_win = t
-        t.title("VRAMeter settings")
+        t.title("Flux settings")
         t.configure(bg=BG)
         t.resizable(False, False)
         t.attributes("-topmost", True)
         try:
-            t.iconbitmap(resource_path("VRAMeter.ico"))
+            t.iconbitmap(resource_path("Flux.ico"))
         except Exception:
             pass
         pad = tk.Frame(t, bg=BG)
@@ -1190,7 +1206,7 @@ class App:
             return
         t = tk.Toplevel(self.root)
         self._log_win = t
-        t.title("VRAMeter log")
+        t.title("Flux log")
         t.configure(bg=BG)
         t.geometry("560x420")
         t.attributes("-topmost", True)
@@ -1512,7 +1528,7 @@ class App:
             self._status(f"Ended {killed} of {n} for {name}.{note}", ACCENT_WARN)
         elif denied:
             self._status(
-                f"Access denied ending {name} — run VRAMeter as administrator.",
+                f"Access denied ending {name} — run Flux as administrator.",
                 ACCENT_WARN)
         elif skipped and not failed:
             self._status(f"{name} already exited.", MUTED)
@@ -1643,9 +1659,9 @@ class App:
         try:
             ts = datetime.datetime.now()
             path = os.path.join(_app_dir(),
-                                f"vram_snapshot_{ts:%Y%m%d_%H%M%S}.txt")
+                                f"flux_snapshot_{ts:%Y%m%d_%H%M%S}.txt")
             with open(path, "w", encoding="utf-8") as f:
-                f.write(f"VRAMeter snapshot ({tag})  {ts:%Y-%m-%d %H:%M:%S}\n")
+                f.write(f"Flux snapshot ({tag})  {ts:%Y-%m-%d %H:%M:%S}\n")
                 f.write(f"GPU: {self.gpu_name}\n")
                 f.write(f"VRAM used: {fmt_gb(used)} / {fmt_gb(self.total)} GB "
                         f"({pct:.0f}%)   cached(no app): {fmt_gb(cached)} GB\n")
@@ -1731,7 +1747,7 @@ def main():
         pass
     root = tk.Tk()
     try:
-        root.iconbitmap(resource_path("VRAMeter.ico"))
+        root.iconbitmap(resource_path("Flux.ico"))
     except Exception:
         pass
     App(root)
