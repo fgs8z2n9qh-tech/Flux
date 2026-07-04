@@ -279,11 +279,17 @@ def vram_total_bytes():
 _PID_RE = re.compile(r"pid_(\d+)")
 
 
-def sample():
+def sample(name_cache=None, force_names=False):
     """Collect one snapshot of GPU memory usage.
 
     Returns dict with: dedicated, shared (bytes) and `procs`, a list of
-    (name, bytes, [pids]) for the heaviest consumers, sorted descending."""
+    (name, bytes, [pids]) for the heaviest consumers, sorted descending.
+
+    Naming: a full Toolhelp32 snapshot (`process_names`) is ~4 ms and dominates
+    the per-tick cost, yet only the handful of pids actually using GPU memory
+    ever need a name. Pass a persistent `name_cache` dict and we snapshot only
+    when a *new* GPU pid appears (or `force_names` for a periodic self-heal
+    against pid reuse); otherwise the cached names are reused for free."""
     dedicated = sum(v for _, v in read_counter_instances(
         r"\GPU Adapter Memory(*)\Dedicated Usage"))
     shared = sum(v for _, v in read_counter_instances(
@@ -299,7 +305,19 @@ def sample():
         pid = int(m.group(1))
         per_pid[pid] = per_pid.get(pid, 0) + val
 
-    names = process_names()
+    # Resolve names for the GPU-using pids only, via the cache when supplied.
+    gpu_pids = [p for p, v in per_pid.items() if v > 0 and p != self_pid]
+    if name_cache is None:
+        names = process_names()
+    elif force_names or any(p not in name_cache for p in gpu_pids):
+        allnames = process_names()
+        name_cache.clear()                   # rebuild → bounded, no stale pids
+        for p in gpu_pids:
+            name_cache[p] = allnames.get(p)
+        names = name_cache
+    else:
+        names = name_cache                   # set unchanged → snapshot skipped
+
     per_name = {}  # label -> [bytes, set(pids)]
     for pid, val in per_pid.items():
         if val <= 0 or pid == self_pid:
@@ -729,6 +747,7 @@ class App:
         self._prev_used = 0
         self._snap_cooldown = 0
         self._tickn = 0
+        self._name_cache = {}            # pid -> exe name, for GPU-using pids
         self._log_path = os.path.join(_app_dir(), "vrameter_log.csv")
 
         self.temp_on = self.sensors.ok and self.show_temp_pref
@@ -1512,7 +1531,10 @@ class App:
     # -- loop -------------------------------------------------------------- #
     def refresh(self):
         try:
-            data = sample()
+            # Reuse the name cache; force a full re-read every ~10 s so a reused
+            # pid can't keep a stale name (display-only — the kill path always
+            # re-validates names against a fresh snapshot before terminating).
+            data = sample(self._name_cache, force_names=self._tickn % 10 == 0)
         except Exception as exc:  # keep the UI alive on transient errors
             data = {"dedicated": 0, "shared": 0, "procs": [],
                     "tracked": 0, "nproc": 0}
