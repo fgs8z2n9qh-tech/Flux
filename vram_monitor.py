@@ -1055,6 +1055,7 @@ class _Scrollbar(tk.Canvas):
         super().__init__(parent, width=width, highlightthickness=0, bd=0, bg=bg)
         self.target = target
         self.first, self.last = 0.0, 1.0
+        self.on_scroll = None            # fired after a drag moves the view
         target.configure(yscrollcommand=self._set)
         self.bind("<Configure>", lambda e: self._draw())
         self.bind("<Button-1>", self._jump)
@@ -1082,6 +1083,8 @@ class _Scrollbar(tk.Canvas):
         span = max(0.0, self.last - self.first)
         self.target.yview_moveto(min(max(0.0, e.y / h - span / 2),
                                      1.0 - span))
+        if self.on_scroll:
+            self.on_scroll()
 
 
 class App:
@@ -1265,9 +1268,13 @@ class App:
         self.plist.pack(side="left", fill="both", expand=True)
         self.scroll = _Scrollbar(lwrap, self.plist, bg=PANEL)
         self.scroll.pack(side="right", fill="y", padx=(5, 0))
+        self.scroll.on_scroll = self._redraw_rows   # virtualize on drag-scroll
         self._plist_w = 0
-        self._proc_list = []          # (name, bytes, pids, critical) per row
-        self._xitems = []             # canvas id of each row's ✕ (for hover recolor)
+        self._proc_list = []          # (name, bytes, pids, critical) — ALL rows
+        self._filtered = []           # rows after search filter (for redraw)
+        self._maxv = 1                # top value, for bar scaling
+        self._show_growth = False
+        self._xitems = {}             # {row: ✕ canvas id} for VISIBLE rows only
         self._hover_i = -1
         self.plist.bind_all("<MouseWheel>", self._on_wheel)
         self.plist.bind("<Configure>", self._on_plist_config)
@@ -1416,6 +1423,7 @@ class App:
 
     def _on_wheel(self, e):
         self.plist.yview_scroll(int(-e.delta / 120), "units")
+        self._redraw_rows()                         # virtualize on wheel-scroll
 
     def _on_cards_resize(self, e):
         # Throttle resize repaints to ~30 fps: paint now if enough time has
@@ -1993,11 +2001,14 @@ class App:
     ROWH = 24
 
     def _on_plist_config(self, e):
-        # Reflow only when the WIDTH changes (height resize must stay cheap).
+        # Width change → full reflow (bar geometry depends on width). Height
+        # change → just re-fill the (now differently sized) visible window.
         if e.width != self._plist_w:
             self._plist_w = e.width
             if self.last:
                 self._draw_procs()
+        elif self.last:
+            self._redraw_rows()
 
     def _plist_row_at(self, e):
         return int(self.plist.canvasy(e.y) // self.ROWH)
@@ -2018,9 +2029,10 @@ class App:
         prev, self._hover_i = self._hover_i, i
         c = self.plist
         for idx in (prev, i):
-            if 0 <= idx < len(self._xitems):
+            xi = self._xitems.get(idx)
+            if xi is not None and 0 <= idx < len(self._proc_list):
                 crit = self._proc_list[idx][3]
-                c.itemconfig(self._xitems[idx], fill=(
+                c.itemconfig(xi, fill=(
                     GRID if crit else
                     ACCENT_HOT2 if idx == self._hover_i else ACCENT_HOT))
         self._draw_hover_hl()
@@ -2088,7 +2100,9 @@ class App:
         if w < 60:
             w = 380
         self._proc_list = []
-        self._xitems = []
+        self._xitems = {}
+        self._filtered = procs
+        self._show_growth = mode == "vram"
         if not procs:
             if mode == "net" and not self.net_etw.ok and not self.filter:
                 c.create_text(2, 14, anchor="w", fill=ACCENT_WARN,
@@ -2112,38 +2126,56 @@ class App:
                           text=msg)
             c.configure(scrollregion=(0, 0, w, self.ROWH))
             return
-        maxv = procs[0][1] or 1
+        self._maxv = procs[0][1] or 1
+        self._proc_list = [(n, v, p, n.lower() in CRITICAL_PROCESSES)
+                           for n, v, p in procs]
+        c.configure(scrollregion=(0, 0, w, len(procs) * self.ROWH + 4))
+        self._redraw_rows()
+
+    def _redraw_rows(self):
+        """Draw only the rows in the viewport (± a small buffer). The list can be
+        100+ long; drawing all of them every tick cost ~14 ms — this is ~2 ms."""
+        procs = self._filtered
+        if not procs:
+            return
+        c = self.plist
+        c.delete("row")
+        c.delete("hl")
+        self._xitems = {}
+        w = c.winfo_width()
+        if w < 60:
+            w = 380
         rh = self.ROWH
-        # Reserve the right end for the value (up to "16,384 MB") + the ✕, so the
-        # bar never runs under the number.
-        xx = w - 12
-        mbx = w - 30
+        maxv = self._maxv
+        xx, mbx = w - 12, w - 30      # value ends before the ✕; bar clears both
         bx0, bx1 = 168, w - 104
-        show_growth = mode == "vram"
-        for i, (name, val, pids) in enumerate(procs):
-            crit = name.lower() in CRITICAL_PROCESSES
-            self._proc_list.append((name, val, pids, crit))
+        top = c.canvasy(0)
+        vh = c.winfo_height() or 1
+        first = max(0, int(top // rh) - 2)
+        last = min(len(procs), int((top + vh) // rh) + 3)
+        for i in range(first, last):
+            name, val, pids = procs[i]
+            crit = self._proc_list[i][3]
             y = i * rh + rh / 2
-            if show_growth and name in self._growing:
+            if self._show_growth and name in self._growing:
                 c.create_text(4, y, text="↑", anchor="w", fill=ACCENT_WARN,
-                              font=self.f_mid)
+                              font=self.f_mid, tags="row")
             c.create_text(18, y, text=name[:22], anchor="w", fill=FG,
-                          font=self.f_mid)
+                          font=self.f_mid, tags="row")
             if bx1 > bx0:
                 self._round_rect(c, bx0, y - 3, bx1, y + 3, 3, fill=TRACK,
-                                 outline="")
+                                 outline="", tags="row")
                 fw = (bx1 - bx0) * val / maxv
                 if fw > 2:
                     self._round_rect(c, bx0, y - 3, bx0 + fw, y + 3, 3,
-                                     fill=ACCENT, outline="")
+                                     fill=ACCENT, outline="", tags="row")
             c.create_text(mbx, y, text=self._fmt_val(val), anchor="e",
-                          fill=MUTED, font=self.f_mono)
+                          fill=MUTED, font=self.f_mono, tags="row")
             xcol = (GRID if crit else
                     ACCENT_HOT2 if i == self._hover_i else ACCENT_HOT)
-            self._xitems.append(c.create_text(xx, y, text="✕", anchor="e",
-                                              fill=xcol, font=self.f_mid))
-        c.configure(scrollregion=(0, 0, w, len(procs) * rh + 4))
-        self._draw_hover_hl()             # re-place the hover highlight (if any)
+            self._xitems[i] = c.create_text(xx, y, text="✕", anchor="e",
+                                            fill=xcol, font=self.f_mid, tags="row")
+        self._draw_hover_hl()
 
     # -- ending a process -------------------------------------------------- #
     def _kill(self, name, pids):
