@@ -50,12 +50,16 @@ A frameless, custom-chrome window (drag the title bar; pin / minimise / maximise
   live process owns (typical after closing a game), an amber line calls it out,
   notes **when** it started climbing, and reminds you **Win+Ctrl+Shift+B** flushes it.
 - **Processes card** — a scrollable, **searchable** list of processes, with a
-  **VRAM / CPU / RAM** selector at the top that turns it into a mini task
-  manager: switch between GPU memory, CPU usage (% of total), and RAM (private
-  working set), each sorted busiest-first with a mini-bar, value, and a red
-  **✕** to end the process (confirmation + a live identity re-check so PID reuse
-  can't make you kill the wrong/critical process). An amber **↑** flags
-  processes whose VRAM keeps climbing — the live leak hunter (VRAM view).
+  **VRAM / CPU / RAM / NET** selector at the top that turns it into a mini task
+  manager: switch between GPU memory, CPU usage (% of total), RAM (private
+  working set), and per-process **network** throughput, each sorted busiest-first
+  with a mini-bar, value, and a red **✕** to end the process (confirmation + a
+  live identity re-check so PID reuse can't make you kill the wrong/critical
+  process). An amber **↑** flags processes whose VRAM keeps climbing — the live
+  leak hunter (VRAM view). The **NET** view is the one feature that needs
+  administrator rights (per-process network comes from an ETW kernel trace);
+  without them it offers a one-click *restart elevated*. Everything else,
+  including the total-throughput Network card, runs with no admin.
 - **Threshold alert** — a corner toast + beep when VRAM crosses the threshold.
 
 ### Leak hunting

@@ -20,6 +20,7 @@ import ctypes
 import datetime
 import json
 import re
+import struct
 import sys
 import os
 import threading
@@ -520,6 +521,288 @@ def net_rates(rx_sampler, tx_sampler):
 
 
 # --------------------------------------------------------------------------- #
+#  Per-process network via ETW (the one admin-only feature). Traces the kernel
+#  network provider; the owning pid + byte count sit in each event's payload
+#  (pid @0, size @4 — validated empirically). Structures are defined in full so
+#  ctypes gets the 64-bit offsets right (a wrong size crashes ProcessTrace).
+# --------------------------------------------------------------------------- #
+_ULONG, _USHORT, _UCHAR = wintypes.ULONG, wintypes.USHORT, ctypes.c_ubyte
+_LONG, _U64, _I64 = wintypes.LONG, ctypes.c_uint64, ctypes.c_int64
+TRACEHANDLE = ctypes.c_uint64
+
+
+class _ETW_GUID(ctypes.Structure):
+    _fields_ = [("Data1", _ULONG), ("Data2", _USHORT), ("Data3", _USHORT),
+                ("Data4", _UCHAR * 8)]
+
+
+def _mkguid(d1, d2, d3, d4):
+    g = _ETW_GUID()
+    g.Data1, g.Data2, g.Data3 = d1, d2, d3
+    for i, b in enumerate(d4):
+        g.Data4[i] = b
+    return g
+
+
+# Microsoft-Windows-Kernel-Network {7DD42A49-5329-4832-8DFD-43D979153A88}
+_KERNEL_NET = _mkguid(0x7DD42A49, 0x5329, 0x4832,
+                      (0x8D, 0xFD, 0x43, 0xD9, 0x79, 0x15, 0x3A, 0x88))
+
+
+class _WNODE_HEADER(ctypes.Structure):
+    _fields_ = [("BufferSize", _ULONG), ("ProviderId", _ULONG),
+                ("HistoricalContext", _U64), ("TimeStamp", _I64),
+                ("Guid", _ETW_GUID), ("ClientContext", _ULONG), ("Flags", _ULONG)]
+
+
+class _EVENT_TRACE_PROPERTIES(ctypes.Structure):
+    _fields_ = [("Wnode", _WNODE_HEADER), ("BufferSize", _ULONG),
+                ("MinimumBuffers", _ULONG), ("MaximumBuffers", _ULONG),
+                ("MaximumFileSize", _ULONG), ("LogFileMode", _ULONG),
+                ("FlushTimer", _ULONG), ("EnableFlags", _ULONG),
+                ("AgeLimit", _LONG), ("NumberOfBuffers", _ULONG),
+                ("FreeBuffers", _ULONG), ("EventsLost", _ULONG),
+                ("BuffersWritten", _ULONG), ("LogBuffersLost", _ULONG),
+                ("RealTimeBuffersLost", _ULONG), ("LoggerThreadId", wintypes.HANDLE),
+                ("LogFileNameOffset", _ULONG), ("LoggerNameOffset", _ULONG)]
+
+
+class _SYSTEMTIME(ctypes.Structure):
+    _fields_ = [(n, _USHORT) for n in ("y", "mo", "dow", "d", "h", "mi", "s", "ms")]
+
+
+class _TZI(ctypes.Structure):
+    _fields_ = [("Bias", _LONG), ("StdName", ctypes.c_wchar * 32),
+                ("StdDate", _SYSTEMTIME), ("StdBias", _LONG),
+                ("DltName", ctypes.c_wchar * 32), ("DltDate", _SYSTEMTIME),
+                ("DltBias", _LONG)]
+
+
+class _TRACE_LOGFILE_HEADER(ctypes.Structure):
+    _fields_ = [("BufferSize", _ULONG), ("Version", _ULONG),
+                ("ProviderVersion", _ULONG), ("NumberOfProcessors", _ULONG),
+                ("EndTime", _I64), ("TimerResolution", _ULONG),
+                ("MaximumFileSize", _ULONG), ("LogFileMode", _ULONG),
+                ("BuffersWritten", _ULONG), ("LogInstanceGuid", _ETW_GUID),
+                ("LoggerName", ctypes.c_void_p), ("LogFileName", ctypes.c_void_p),
+                ("TimeZone", _TZI), ("BootTime", _I64), ("PerfFreq", _I64),
+                ("StartTime", _I64), ("ReservedFlags", _ULONG),
+                ("BuffersLost", _ULONG)]
+
+
+class _EVENT_TRACE_HEADER(ctypes.Structure):
+    _fields_ = [("Size", _USHORT), ("FieldTypeFlags", _USHORT), ("Version", _ULONG),
+                ("ThreadId", _ULONG), ("ProcessId", _ULONG), ("TimeStamp", _I64),
+                ("Guid", _ETW_GUID), ("ClientContext", _ULONG), ("Flags", _ULONG)]
+
+
+class _ETW_BUFFER_CONTEXT(ctypes.Structure):
+    _fields_ = [("ProcessorNumber", _UCHAR), ("Alignment", _UCHAR),
+                ("LoggerId", _USHORT)]
+
+
+class _EVENT_TRACE(ctypes.Structure):
+    _fields_ = [("Header", _EVENT_TRACE_HEADER), ("InstanceId", _ULONG),
+                ("ParentInstanceId", _ULONG), ("ParentGuid", _ETW_GUID),
+                ("MofData", ctypes.c_void_p), ("MofLength", _ULONG),
+                ("ClientContext", _ULONG)]
+
+
+class _EVENT_DESCRIPTOR(ctypes.Structure):
+    _fields_ = [("Id", _USHORT), ("Version", _UCHAR), ("Channel", _UCHAR),
+                ("Level", _UCHAR), ("Opcode", _UCHAR), ("Task", _USHORT),
+                ("Keyword", _U64)]
+
+
+class _EVENT_HEADER(ctypes.Structure):
+    _fields_ = [("Size", _USHORT), ("HeaderType", _USHORT), ("Flags", _USHORT),
+                ("EventProperty", _USHORT), ("ThreadId", _ULONG),
+                ("ProcessId", _ULONG), ("TimeStamp", _I64),
+                ("ProviderId", _ETW_GUID), ("EventDescriptor", _EVENT_DESCRIPTOR),
+                ("KernelTime", _ULONG), ("UserTime", _ULONG),
+                ("ActivityId", _ETW_GUID)]
+
+
+class _EVENT_RECORD(ctypes.Structure):
+    _fields_ = [("EventHeader", _EVENT_HEADER),
+                ("BufferContext", _ETW_BUFFER_CONTEXT),
+                ("ExtendedDataCount", _USHORT), ("UserDataLength", _USHORT),
+                ("ExtendedData", ctypes.c_void_p), ("UserData", ctypes.c_void_p),
+                ("UserContext", ctypes.c_void_p)]
+
+
+_EVENT_RECORD_CALLBACK = ctypes.WINFUNCTYPE(None, ctypes.POINTER(_EVENT_RECORD))
+
+
+class _EVENT_TRACE_LOGFILE(ctypes.Structure):
+    _fields_ = [("LogFileName", wintypes.LPWSTR), ("LoggerName", wintypes.LPWSTR),
+                ("CurrentTime", _I64), ("BuffersRead", _ULONG),
+                ("ProcessTraceMode", _ULONG), ("CurrentEvent", _EVENT_TRACE),
+                ("LogfileHeader", _TRACE_LOGFILE_HEADER),
+                ("BufferCallback", ctypes.c_void_p), ("BufferSize", _ULONG),
+                ("Filled", _ULONG), ("EventsLost", _ULONG),
+                ("EventRecordCallback", _EVENT_RECORD_CALLBACK),
+                ("IsKernelTrace", _ULONG), ("Context", ctypes.c_void_p)]
+
+
+advapi32 = ctypes.WinDLL("advapi32.dll")
+advapi32.StartTraceW.argtypes = [ctypes.POINTER(TRACEHANDLE), wintypes.LPCWSTR,
+                                 ctypes.POINTER(_EVENT_TRACE_PROPERTIES)]
+advapi32.StartTraceW.restype = _ULONG
+advapi32.EnableTraceEx2.argtypes = [TRACEHANDLE, ctypes.POINTER(_ETW_GUID), _ULONG,
+                                    _UCHAR, _U64, _U64, _ULONG, ctypes.c_void_p]
+advapi32.EnableTraceEx2.restype = _ULONG
+advapi32.ControlTraceW.argtypes = [TRACEHANDLE, wintypes.LPCWSTR,
+                                   ctypes.POINTER(_EVENT_TRACE_PROPERTIES), _ULONG]
+advapi32.ControlTraceW.restype = _ULONG
+advapi32.OpenTraceW.argtypes = [ctypes.POINTER(_EVENT_TRACE_LOGFILE)]
+advapi32.OpenTraceW.restype = TRACEHANDLE
+advapi32.ProcessTrace.argtypes = [ctypes.POINTER(TRACEHANDLE), _ULONG,
+                                  ctypes.c_void_p, ctypes.c_void_p]
+advapi32.ProcessTrace.restype = _ULONG
+advapi32.CloseTrace.argtypes = [TRACEHANDLE]
+advapi32.CloseTrace.restype = _ULONG
+
+_WNODE_FLAG_TRACED_GUID = 0x00020000
+_ETW_REAL_TIME_MODE = 0x00000100
+_PTM_REAL_TIME = 0x00000100
+_PTM_EVENT_RECORD = 0x10000000
+_ENABLE_PROVIDER = 1
+_CTRL_STOP = 1
+_LEVEL_VERBOSE = 5
+_KW_IPV4, _KW_IPV6 = 0x10, 0x20
+_ERR_ALREADY_EXISTS = 183
+_INVALID_TRACEHANDLE = 0xFFFFFFFFFFFFFFFF
+
+
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+class NetEtw:
+    """Per-process network throughput via a real-time ETW trace of the kernel
+    network provider. Needs admin (EnableTraceEx2 is ACCESS_DENIED otherwise).
+    ProcessTrace blocks, so it runs on a daemon thread; the callback tallies
+    bytes per pid and sample() returns bytes/sec per pid since the last call."""
+    SESSION = "FluxNet"
+    SEND_IDS = {10, 26, 42, 58}
+    RECV_IDS = {11, 27, 43, 59}
+
+    def __init__(self):
+        self.ok = False
+        self.attempted = False
+        self.admin_needed = False
+        self._h = TRACEHANDLE(0)
+        self._th = 0
+        self._thread = None
+        self._cb = None
+        self._lock = threading.Lock()
+        self._acc = {}
+        self._last_t = None
+
+    def _props(self):
+        size = ctypes.sizeof(_EVENT_TRACE_PROPERTIES) + (len(self.SESSION) + 1) * 2 + 8
+        buf = (ctypes.c_byte * size)()
+        p = ctypes.cast(buf, ctypes.POINTER(_EVENT_TRACE_PROPERTIES))
+        p.contents.Wnode.BufferSize = size
+        p.contents.Wnode.Flags = _WNODE_FLAG_TRACED_GUID
+        p.contents.Wnode.ClientContext = 1
+        p.contents.LogFileMode = _ETW_REAL_TIME_MODE
+        p.contents.LoggerNameOffset = ctypes.sizeof(_EVENT_TRACE_PROPERTIES)
+        return buf, p
+
+    def _on_event(self, rec):
+        r = rec.contents
+        eid = r.EventHeader.EventDescriptor.Id
+        if (eid in self.SEND_IDS or eid in self.RECV_IDS) and \
+                r.UserData and r.UserDataLength >= 8:
+            pid, size = struct.unpack_from("<II", ctypes.string_at(r.UserData, 8))
+            with self._lock:
+                self._acc[pid] = self._acc.get(pid, 0) + size
+
+    def start(self):
+        if self.ok:
+            return True
+        self.attempted = True
+        buf, p = self._props()
+        st = advapi32.StartTraceW(ctypes.byref(self._h), self.SESSION, p)
+        if st == _ERR_ALREADY_EXISTS:            # stale session from a crash
+            advapi32.ControlTraceW(0, self.SESSION, p, _CTRL_STOP)
+            buf, p = self._props()
+            st = advapi32.StartTraceW(ctypes.byref(self._h), self.SESSION, p)
+        if st != 0:
+            self.admin_needed = st == 5
+            return False
+        en = advapi32.EnableTraceEx2(
+            self._h, ctypes.byref(_KERNEL_NET), _ENABLE_PROVIDER, _LEVEL_VERBOSE,
+            _KW_IPV4 | _KW_IPV6, 0, 0, None)
+        if en != 0:
+            self.admin_needed = en == 5
+            advapi32.ControlTraceW(self._h, self.SESSION, p, _CTRL_STOP)
+            return False
+        self._cb = _EVENT_RECORD_CALLBACK(self._on_event)
+        lf = _EVENT_TRACE_LOGFILE()
+        lf.LoggerName = self.SESSION
+        lf.ProcessTraceMode = _PTM_REAL_TIME | _PTM_EVENT_RECORD
+        lf.EventRecordCallback = self._cb
+        self._th = advapi32.OpenTraceW(ctypes.byref(lf))
+        if self._th == _INVALID_TRACEHANDLE:
+            advapi32.ControlTraceW(self._h, self.SESSION, p, _CTRL_STOP)
+            return False
+        self._last_t = time.monotonic()
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+        self.ok, self.admin_needed = True, False
+        return True
+
+    def _pump(self):
+        advapi32.ProcessTrace((TRACEHANDLE * 1)(self._th), 1, None, None)
+
+    def sample(self):
+        """{pid: bytes_per_sec} since the previous call."""
+        now = time.monotonic()
+        with self._lock:
+            acc, self._acc = self._acc, {}
+        dt = max(1e-3, now - (self._last_t or now))
+        self._last_t = now
+        return {pid: b / dt for pid, b in acc.items()}
+
+    def stop(self):
+        if self._h.value == 0:
+            return
+        try:
+            buf, p = self._props()
+            advapi32.ControlTraceW(self._h, self.SESSION, p, _CTRL_STOP)
+            if self._th:
+                advapi32.CloseTrace(self._th)
+            if self._thread:
+                self._thread.join(timeout=2)
+        except Exception:
+            pass
+        self.ok = False
+        self._h = TRACEHANDLE(0)
+        self._th = 0
+        self._thread = None
+
+
+def net_procs(netetw):
+    """[(name, bytes_per_sec, None), ...] busiest first, aggregated by name."""
+    rates = netetw.sample()
+    names = process_names()
+    agg = {}
+    for pid, rate in rates.items():
+        nm = names.get(pid)
+        nm = re.sub(r"\.exe$", "", nm, flags=re.IGNORECASE) if nm else f"pid {pid}"
+        agg[nm] = agg.get(nm, 0.0) + rate
+    procs = [(n, v, None) for n, v in agg.items() if v > 0]
+    procs.sort(key=lambda t: t[1], reverse=True)
+    return procs
+
+
+# --------------------------------------------------------------------------- #
 #  UI
 # --------------------------------------------------------------------------- #
 
@@ -825,8 +1108,9 @@ class App:
         self.net_tx_sampler = RateSampler(NET_TX_COUNTER)
         self.net_rx = self.net_tx = 0.0
         self._ncpu = os.cpu_count() or 1
-        self._proc_mode = self.cfg.get("proc_mode")   # vram | cpu | ram
+        self._proc_mode = self.cfg.get("proc_mode")   # vram | cpu | ram | net
         self._active_procs = []                        # rows for the current mode
+        self.net_etw = NetEtw()                        # per-process net (admin)
         self.sensors = GpuSensors()
         self.sensors_data = {}
         self.gpu_engines = {}
@@ -946,8 +1230,8 @@ class App:
         card.place(x=9, y=9, relwidth=1, relheight=1, width=-18, height=-18)
         phead = tk.Frame(card, bg=PANEL)
         phead.pack(fill="x", padx=6, pady=(8, 5))
-        # segmented VRAM / CPU / RAM selector — the "mini task manager" switch
-        self._seg = tk.Canvas(phead, width=147, height=24, bg=PANEL,
+        # segmented VRAM / CPU / RAM / NET selector — the "mini task manager"
+        self._seg = tk.Canvas(phead, width=176, height=24, bg=PANEL,
                               highlightthickness=0, bd=0, cursor="hand2")
         self._seg.pack(side="left")
         self._seg.bind("<Button-1>", self._seg_click)
@@ -957,7 +1241,7 @@ class App:
         self.lbl_prochead.pack(side="left", padx=(8, 0))
         # rounded search box: a borderless Entry embedded in a small rounded
         # canvas whose outline turns accent-coloured on focus.
-        sbox = tk.Canvas(phead, width=130, height=26, bg=PANEL,
+        sbox = tk.Canvas(phead, width=116, height=26, bg=PANEL,
                          highlightthickness=0, bd=0)
         sbox.pack(side="right")
         self._search_box = sbox
@@ -965,7 +1249,7 @@ class App:
         self.search = tk.Entry(sbox, bg=TRACK, fg=FG, insertbackground=FG,
                                font=self.f_small, relief="flat", bd=0,
                                highlightthickness=0)
-        sbox.create_window(13, 13, window=self.search, anchor="w", width=106,
+        sbox.create_window(12, 13, window=self.search, anchor="w", width=94,
                            height=18)
         self.search.bind("<KeyRelease>", self._on_search)
         self.search.bind("<FocusIn>", lambda e: self._draw_search_box(True))
@@ -1167,6 +1451,7 @@ class App:
                 self.cfg.set("geometry", self.root.geometry())
         except Exception:
             pass
+        self.net_etw.stop()               # never orphan the ETW session
         self.root.destroy()
 
     def _on_search(self, e=None):
@@ -1184,8 +1469,9 @@ class App:
         self._round_rect(c, 1, 1, w - 1, h - 1, 8, fill=TRACK,
                          outline=ACCENT if focused else GRID, tags="box")
 
-    # -- process view selector (VRAM / CPU / RAM) -------------------------- #
-    _PROC_MODES = [("vram", "VRAM"), ("cpu", "CPU"), ("ram", "RAM")]
+    # -- process view selector (VRAM / CPU / RAM / NET) -------------------- #
+    _PROC_MODES = [("vram", "VRAM"), ("cpu", "CPU"), ("ram", "RAM"),
+                   ("net", "NET")]
 
     def _draw_seg(self):
         """Segmented pill selector; the active mode gets an accent-filled pill."""
@@ -1212,6 +1498,11 @@ class App:
     def _set_proc_mode(self, mode):
         if mode == self._proc_mode:
             return
+        if mode == "net":
+            if not self.net_etw.admin_needed:
+                self.net_etw.start()      # begin the ETW trace (needs admin)
+        elif self._proc_mode == "net":
+            self.net_etw.stop()           # stop tracing when leaving NET
         self._proc_mode = mode
         self.cfg.set("proc_mode", mode)
         self.filter = ""
@@ -1229,6 +1520,11 @@ class App:
                 self._active_procs = cpu_procs(self.proc_cpu_sampler, self._ncpu)
             elif self._proc_mode == "ram":
                 self._active_procs = ram_procs()
+            elif self._proc_mode == "net":
+                if not self.net_etw.ok and not self.net_etw.attempted:
+                    self.net_etw.start()          # lazy start (persisted NET mode)
+                self._active_procs = (net_procs(self.net_etw)
+                                      if self.net_etw.ok else [])
             else:
                 self._active_procs = (self.last or {}).get("procs", [])
         except Exception:
@@ -1237,6 +1533,8 @@ class App:
     def _fmt_val(self, val):
         if self._proc_mode == "cpu":
             return f"{val:.0f}%"
+        if self._proc_mode == "net":
+            return fmt_bits(val)
         return f"{gb(val) * 1024:,.0f} MB"        # vram + ram both in MB
 
     def _pids_for_name(self, name):
@@ -1717,16 +2015,43 @@ class App:
                 self._draw_procs()
 
     def _plist_click(self, e):
+        if self._proc_mode == "net" and not self.net_etw.ok:
+            self._restart_as_admin()        # the "click to restart elevated" cue
+            return
         w = self.plist.winfo_width()
         i = self._plist_row_at(e)
         if 0 <= i < len(self._proc_list) and e.x >= w - 26:
             name, val, pids, crit = self._proc_list[i]
             if crit:
                 return
-            if pids is None:                    # CPU/RAM row → resolve pids now
+            if pids is None:                # CPU/RAM/NET row → resolve pids now
                 pids = self._pids_for_name(name)
             if pids:
                 self._kill(name, pids)
+
+    def _restart_as_admin(self):
+        """Relaunch Flux elevated (UAC) so the ETW net trace can run, then close
+        this instance. No-op if the user declines the prompt."""
+        try:
+            if not self._maxed:
+                self.cfg.set("geometry", self.root.geometry())
+        except Exception:
+            pass
+        try:
+            if getattr(sys, "frozen", False):
+                exe, params = sys.executable, None
+            else:
+                exe = sys.executable
+                params = f'"{os.path.abspath(sys.argv[0])}"'
+            rc = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", exe, params, None, 1)
+            if rc > 32:                      # >32 = launched (UAC accepted)
+                self.net_etw.stop()
+                self.root.destroy()
+            else:
+                self._status("Elevation cancelled.", MUTED)
+        except Exception:
+            pass
 
     def _draw_procs(self):
         mode = self._proc_mode
@@ -1741,10 +2066,20 @@ class App:
             w = 380
         self._proc_list = []
         if not procs:
+            if mode == "net" and not self.net_etw.ok and not self.filter:
+                c.create_text(2, 14, anchor="w", fill=ACCENT_WARN,
+                              font=self.f_small,
+                              text="Per-process network needs administrator.")
+                c.create_text(2, 36, anchor="w", fill=ACCENT, font=self.f_small,
+                              text="↻  Click here to restart Flux elevated")
+                c.configure(scrollregion=(0, 0, w, self.ROWH * 2))
+                return
             if self.filter:
                 msg = "No match"
             elif mode == "cpu":
                 msg = "Measuring CPU…"
+            elif mode == "net":
+                msg = "Measuring network…"
             elif mode == "ram":
                 msg = "No processes"
             else:
