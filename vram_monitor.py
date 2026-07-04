@@ -490,6 +490,35 @@ def ram_procs():
     return procs
 
 
+# Total network throughput (no per-process — that needs ETW/admin). Rate
+# counters, so via RateSampler.
+NET_RX_COUNTER = r"\Network Interface(*)\Bytes Received/sec"
+NET_TX_COUNTER = r"\Network Interface(*)\Bytes Sent/sec"
+# Skip loopback / tunnels / virtual adapters — Hyper-V, WSL, VPN and VM bridges
+# mirror the physical NIC's traffic (and can flip its direction), so summing all
+# interfaces double-counts. We pick the single busiest real interface instead.
+_NET_SKIP = ("loopback", "isatap", "teredo", "pseudo", "vethernet", "virtual",
+             "vmware", "hyper-v", "tap-windows", "tunnel", "vpn",
+             "wan miniport", "wi-fi direct", "bluetooth")
+
+
+def _net_real(pairs):
+    return {n: max(0.0, v) for n, v in pairs
+            if n and not any(s in n.lower() for s in _NET_SKIP)}
+
+
+def net_rates(rx_sampler, tx_sampler):
+    """(rx_bytes_s, tx_bytes_s) for the busiest real interface — one adapter,
+    so mirrored virtual-adapter traffic isn't counted twice."""
+    rx = _net_real(rx_sampler.read())
+    tx = _net_real(tx_sampler.read())
+    names = set(rx) | set(tx)
+    if not names:
+        return 0.0, 0.0
+    best = max(names, key=lambda n: rx.get(n, 0.0) + tx.get(n, 0.0))
+    return rx.get(best, 0.0), tx.get(best, 0.0)
+
+
 # --------------------------------------------------------------------------- #
 #  UI
 # --------------------------------------------------------------------------- #
@@ -540,6 +569,16 @@ def gb(n):
 
 def fmt_gb(n):
     return f"{gb(n):.1f}"
+
+
+def fmt_bits(bytes_per_sec):
+    """Network rate in bits/s (Task Manager style): Mbps / Kbps / bps."""
+    bits = bytes_per_sec * 8
+    if bits >= 1e6:
+        return f"{bits / 1e6:.1f} Mbps"
+    if bits >= 1e3:
+        return f"{bits / 1e3:.0f} Kbps"
+    return f"{bits:.0f} bps"
 
 
 def usage_color(pct):
@@ -614,8 +653,8 @@ def _migrate_legacy_file(new_name, old_name):
 class Config:
     """Tiny JSON settings store kept next to the app."""
     DEFAULTS = {"refresh_ms": 1000, "alert_pct": 90, "accent": "green",
-                "show_temp": True, "show_cpu": True, "geometry": None,
-                "mini_geometry": None, "proc_mode": "vram"}
+                "show_temp": True, "show_cpu": True, "show_net": True,
+                "geometry": None, "mini_geometry": None, "proc_mode": "vram"}
 
     def __init__(self):
         _migrate_legacy_file("flux_config.json", "vrameter_config.json")
@@ -770,15 +809,21 @@ class App:
         self.refresh_ms = int(self.cfg.get("refresh_ms"))
         self.alert_pct = int(self.cfg.get("alert_pct"))
         self.show_cpu = bool(self.cfg.get("show_cpu"))
+        self.show_net = bool(self.cfg.get("show_net"))
         self.show_temp_pref = bool(self.cfg.get("show_temp"))
 
         self.total, self.gpu_name = vram_total_bytes()
         self.hist_vram = deque([0.0] * HISTORY, maxlen=HISTORY)
         self.hist_gpu = deque([0.0] * HISTORY, maxlen=HISTORY)
         self.hist_temp = deque([0.0] * HISTORY, maxlen=HISTORY)
+        self.hist_net_rx = deque([0.0] * HISTORY, maxlen=HISTORY)
+        self.hist_net_tx = deque([0.0] * HISTORY, maxlen=HISTORY)
         self.gpu_sampler = RateSampler(GPU_ENGINE_COUNTER)
         self.cpu_sampler = RateSampler(CPU_COUNTER)
         self.proc_cpu_sampler = RateSampler(PROC_CPU_COUNTER)  # per-process CPU
+        self.net_rx_sampler = RateSampler(NET_RX_COUNTER)
+        self.net_tx_sampler = RateSampler(NET_TX_COUNTER)
+        self.net_rx = self.net_tx = 0.0
         self._ncpu = os.cpu_count() or 1
         self._proc_mode = self.cfg.get("proc_mode")   # vram | cpu | ram
         self._active_procs = []                        # rows for the current mode
@@ -812,6 +857,8 @@ class App:
         cb = 248                              # top + VRAM + GPU-load cards
         if self.temp_on:
             cb += 112
+        if self.show_net:
+            cb += 96                          # NETWORK card
         cb += 58                              # FREE / SHARED row
         if self.show_cpu:
             cb += 58                          # CPU / RAM row
@@ -1241,7 +1288,8 @@ class App:
     def _relayout(self):
         """Recompute which cards show + the window height, then repaint."""
         self.temp_on = self.sensors.ok and self.show_temp_pref
-        cb = 248 + (112 if self.temp_on else 0) + 58
+        cb = 248 + (112 if self.temp_on else 0) + (96 if self.show_net else 0)
+        cb += 58
         cb += 58 if self.show_cpu else 0
         cb += 40
         self._minh = cb + 84
@@ -1339,6 +1387,7 @@ class App:
         cap("CARDS")
         self._v_temp = tk.BooleanVar(value=self.show_temp_pref)
         self._v_cpu = tk.BooleanVar(value=self.show_cpu)
+        self._v_net = tk.BooleanVar(value=self.show_net)
 
         def chk(text, var, key, attr, enabled=True):
             # Rounded checkbox (canvas) + label — tk.Checkbutton's indicator is
@@ -1382,6 +1431,7 @@ class App:
             tk.Label(pad, text="(temp sensors unavailable)", bg=BG, fg=MUTED,
                      font=self.f_cap).pack(anchor="w")
         chk("CPU / RAM card", self._v_cpu, "show_cpu", "show_cpu")
+        chk("Network card", self._v_net, "show_net", "show_net")
 
     def _set_accent(self, name):
         apply_accent(name)
@@ -1477,6 +1527,20 @@ class App:
         c.create_polygon([x0, y1] + flat + [x1, y1],
                          fill=self._tint(color, PANEL), outline="", tags="fg")
         c.create_line(flat, fill=color, width=1.5, smooth=True, tags="fg")
+
+    def _net_spark(self, c, x0, y0, x1, y1):
+        """Download (filled accent) + upload (secondary line) on a shared,
+        auto-scaled axis — network rates have no fixed 0..100 range."""
+        rx, tx = list(self.hist_net_rx), list(self.hist_net_tx)
+        peak = max(max(rx), max(tx), 1.0)
+        self._spark(c, [v / peak * 100 for v in rx], x0, y0, x1, y1, ACCENT)
+        tn = [v / peak * 100 for v in tx]
+        if x1 - x0 >= 4 and len(tn) >= 2:
+            step = (x1 - x0) / (len(tn) - 1)
+            hh = y1 - y0
+            pts = [k for i, v in enumerate(tn)
+                   for k in (x0 + i * step, y1 - (hh - 2) * min(v, 100) / 100 - 1)]
+            c.create_line(pts, fill=GPU_LINE, width=1.5, smooth=True, tags="fg")
 
     def _mini(self, c, x0, y, x1, label, value, vcol=FG):
         self._card(c, x0, y, x1, y + 50)
@@ -1585,6 +1649,19 @@ class App:
                           fill=MUTED, font=self.f_small, tags="fg")
             self._spark(c, list(self.hist_temp), x0 + 12, y + 78, x1 - 12,
                         y1 - 8, ACCENT_WARN)
+            y = y1 + gap
+
+        # --- NETWORK card (total throughput, down + up) ---
+        if self.show_net:
+            y1 = y + 86
+            self._card(c, x0, y, x1, y1)
+            c.create_text(x0 + 12, y + 17, text="NETWORK", anchor="w",
+                          fill=MUTED, font=self.f_cap, tags="fg")
+            c.create_text(x0 + 12, y + 45, text=f"↓ {fmt_bits(self.net_rx)}",
+                          anchor="w", fill=ACCENT, font=self.f_stat, tags="fg")
+            c.create_text(x1 - 12, y + 45, text=f"↑ {fmt_bits(self.net_tx)}",
+                          anchor="e", fill=GPU_LINE, font=self.f_stat, tags="fg")
+            self._net_spark(c, x0 + 12, y + 58, x1 - 12, y1 - 8)
             y = y1 + gap
 
         # --- FREE / SHARED (+ CPU / RAM) mini-cards ---
@@ -1768,6 +1845,14 @@ class App:
             self.ram = ram_info()
         except Exception:
             pass
+        if self.show_net:
+            try:
+                self.net_rx, self.net_tx = net_rates(
+                    self.net_rx_sampler, self.net_tx_sampler)
+            except Exception:
+                pass
+        self.hist_net_rx.append(self.net_rx)
+        self.hist_net_tx.append(self.net_tx)
         self.last = data
         self._tickn += 1
 

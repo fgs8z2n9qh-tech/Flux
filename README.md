@@ -42,6 +42,9 @@ A frameless, custom-chrome window (drag the title bar; pin / minimise / maximise
   **engines** (3D / Video / Copy / Compute), and a sparkline.
 - **GPU temp card** — core temp (colour-coded), hot-spot and VRAM temps, core /
   memory clocks, fan rpm, and a temperature trend sparkline.
+- **Network card** — total download / upload throughput with a dual-line trend
+  graph, read off the busiest real interface so VPN / Hyper-V / WSL adapters
+  don't double-count. No admin (per-process network would need ETW).
 - **Free / Shared / CPU / RAM cards** — free and shared VRAM, plus CPU % and RAM.
 - **Driver-cached / leak warning** — when the card reports VRAM in use that no
   live process owns (typical after closing a game), an amber line calls it out,
