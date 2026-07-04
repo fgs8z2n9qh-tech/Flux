@@ -46,11 +46,13 @@ A frameless, custom-chrome window (drag the title bar; pin / minimise / maximise
 - **Driver-cached / leak warning** — when the card reports VRAM in use that no
   live process owns (typical after closing a game), an amber line calls it out,
   notes **when** it started climbing, and reminds you **Win+Ctrl+Shift+B** flushes it.
-- **Processes card** — a scrollable, **searchable** list of every process using
-  GPU memory, each with a mini-bar, MB value, and a red **✕** to end it
-  (confirmation + a live identity re-check so PID reuse can't make you kill the
-  wrong/critical process). An amber **↑** flags processes whose VRAM keeps
-  climbing — the live leak hunter.
+- **Processes card** — a scrollable, **searchable** list of processes, with a
+  **VRAM / CPU / RAM** selector at the top that turns it into a mini task
+  manager: switch between GPU memory, CPU usage (% of total), and RAM (private
+  working set), each sorted busiest-first with a mini-bar, value, and a red
+  **✕** to end the process (confirmation + a live identity re-check so PID reuse
+  can't make you kill the wrong/critical process). An amber **↑** flags
+  processes whose VRAM keeps climbing — the live leak hunter (VRAM view).
 - **Threshold alert** — a corner toast + beep when VRAM crosses the threshold.
 
 ### Leak hunting

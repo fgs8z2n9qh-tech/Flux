@@ -452,6 +452,43 @@ def ram_info():
 
 CPU_COUNTER = r"\Processor(_Total)\% Processor Time"
 
+# Per-process "mini task manager" views — all via PDH, no new dependencies.
+PROC_CPU_COUNTER = r"\Process(*)\% Processor Time"        # rate (0..100*ncpu)
+PROC_RAM_COUNTER = r"\Process(*)\Working Set - Private"   # instantaneous bytes
+_PROC_INST_SKIP = {"_total", "idle"}                      # PDH pseudo-instances
+_HASHNUM_RE = re.compile(r"#\d+$")
+
+
+def _agg_proc_by_name(pairs):
+    """Aggregate \\Process(*) instances by base image name — PDH suffixes
+    duplicate names with '#1', '#2' — dropping the _Total / Idle pseudo rows."""
+    out = {}
+    for name, val in pairs:
+        if not name:
+            continue
+        base = _HASHNUM_RE.sub("", name)
+        if base.lower() in _PROC_INST_SKIP:
+            continue
+        out[base] = out.get(base, 0) + val
+    return out
+
+
+def cpu_procs(sampler, ncpu):
+    """[(name, cpu_percent_of_total, None), ...] busiest first. The rate counter
+    reports 0..100 per core, so divide the per-name sum by the core count."""
+    agg = _agg_proc_by_name(sampler.read())
+    procs = [(n, v / max(1, ncpu), None) for n, v in agg.items() if v > 0.05]
+    procs.sort(key=lambda t: t[1], reverse=True)
+    return procs
+
+
+def ram_procs():
+    """[(name, private_working_set_bytes, None), ...] biggest first."""
+    agg = _agg_proc_by_name(read_counter_instances(PROC_RAM_COUNTER))
+    procs = [(n, v, None) for n, v in agg.items() if v > 0]
+    procs.sort(key=lambda t: t[1], reverse=True)
+    return procs
+
 
 # --------------------------------------------------------------------------- #
 #  UI
@@ -578,7 +615,7 @@ class Config:
     """Tiny JSON settings store kept next to the app."""
     DEFAULTS = {"refresh_ms": 1000, "alert_pct": 90, "accent": "green",
                 "show_temp": True, "show_cpu": True, "geometry": None,
-                "mini_geometry": None}
+                "mini_geometry": None, "proc_mode": "vram"}
 
     def __init__(self):
         _migrate_legacy_file("flux_config.json", "vrameter_config.json")
@@ -741,6 +778,10 @@ class App:
         self.hist_temp = deque([0.0] * HISTORY, maxlen=HISTORY)
         self.gpu_sampler = RateSampler(GPU_ENGINE_COUNTER)
         self.cpu_sampler = RateSampler(CPU_COUNTER)
+        self.proc_cpu_sampler = RateSampler(PROC_CPU_COUNTER)  # per-process CPU
+        self._ncpu = os.cpu_count() or 1
+        self._proc_mode = self.cfg.get("proc_mode")   # vram | cpu | ram
+        self._active_procs = []                        # rows for the current mode
         self.sensors = GpuSensors()
         self.sensors_data = {}
         self.gpu_engines = {}
@@ -857,13 +898,19 @@ class App:
         card = tk.Frame(holder, bg=PANEL)
         card.place(x=9, y=9, relwidth=1, relheight=1, width=-18, height=-18)
         phead = tk.Frame(card, bg=PANEL)
-        phead.pack(fill="x", padx=6, pady=(8, 4))
-        self.lbl_prochead = tk.Label(phead, text="PROCESSES", bg=PANEL,
-                                     fg=MUTED, font=self.f_small)
-        self.lbl_prochead.pack(side="left")
+        phead.pack(fill="x", padx=6, pady=(8, 5))
+        # segmented VRAM / CPU / RAM selector — the "mini task manager" switch
+        self._seg = tk.Canvas(phead, width=147, height=24, bg=PANEL,
+                              highlightthickness=0, bd=0, cursor="hand2")
+        self._seg.pack(side="left")
+        self._seg.bind("<Button-1>", self._seg_click)
+        self._draw_seg()
+        self.lbl_prochead = tk.Label(phead, text="", bg=PANEL, fg=MUTED,
+                                     font=self.f_cap, width=4, anchor="w")
+        self.lbl_prochead.pack(side="left", padx=(8, 0))
         # rounded search box: a borderless Entry embedded in a small rounded
         # canvas whose outline turns accent-coloured on focus.
-        sbox = tk.Canvas(phead, width=150, height=26, bg=PANEL,
+        sbox = tk.Canvas(phead, width=130, height=26, bg=PANEL,
                          highlightthickness=0, bd=0)
         sbox.pack(side="right")
         self._search_box = sbox
@@ -871,7 +918,7 @@ class App:
         self.search = tk.Entry(sbox, bg=TRACK, fg=FG, insertbackground=FG,
                                font=self.f_small, relief="flat", bd=0,
                                highlightthickness=0)
-        sbox.create_window(14, 13, window=self.search, anchor="w", width=126,
+        sbox.create_window(13, 13, window=self.search, anchor="w", width=106,
                            height=18)
         self.search.bind("<KeyRelease>", self._on_search)
         self.search.bind("<FocusIn>", lambda e: self._draw_search_box(True))
@@ -1078,7 +1125,7 @@ class App:
     def _on_search(self, e=None):
         self.filter = self.search.get().strip()
         if self.last:
-            self._draw_procs(self.last["procs"])
+            self._draw_procs()
 
     def _draw_search_box(self, focused):
         """Rounded backing for the search Entry; accent outline when focused.
@@ -1089,6 +1136,68 @@ class App:
         w, h = int(c["width"]), int(c["height"])
         self._round_rect(c, 1, 1, w - 1, h - 1, 8, fill=TRACK,
                          outline=ACCENT if focused else GRID, tags="box")
+
+    # -- process view selector (VRAM / CPU / RAM) -------------------------- #
+    _PROC_MODES = [("vram", "VRAM"), ("cpu", "CPU"), ("ram", "RAM")]
+
+    def _draw_seg(self):
+        """Segmented pill selector; the active mode gets an accent-filled pill."""
+        c = self._seg
+        c.delete("all")
+        w, h = int(c["width"]), int(c["height"])
+        seg = w / len(self._PROC_MODES)
+        self._round_rect(c, 0, 0, w, h, 7, fill=TRACK, outline="")
+        for i, (mode, label) in enumerate(self._PROC_MODES):
+            x0 = i * seg
+            active = mode == self._proc_mode
+            if active:
+                self._round_rect(c, x0 + 2, 2, x0 + seg - 2, h - 2, 6,
+                                 fill=ACCENT, outline="")
+            c.create_text(x0 + seg / 2, h / 2, text=label, anchor="center",
+                          fill=BG if active else MUTED, font=self.f_small)
+
+    def _seg_click(self, e):
+        seg = int(self._seg["width"]) / len(self._PROC_MODES)
+        i = int(e.x // seg)
+        if 0 <= i < len(self._PROC_MODES):
+            self._set_proc_mode(self._PROC_MODES[i][0])
+
+    def _set_proc_mode(self, mode):
+        if mode == self._proc_mode:
+            return
+        self._proc_mode = mode
+        self.cfg.set("proc_mode", mode)
+        self.filter = ""
+        self.search.delete(0, "end")
+        self._draw_seg()
+        self._refresh_active_procs()
+        self.lbl_prochead.config(text=str(len(self._active_procs)))
+        self._draw_procs()
+
+    def _refresh_active_procs(self):
+        """Recompute the per-process list for the current mode (VRAM rows come
+        free from the last sample; CPU/RAM are their own PDH reads)."""
+        try:
+            if self._proc_mode == "cpu":
+                self._active_procs = cpu_procs(self.proc_cpu_sampler, self._ncpu)
+            elif self._proc_mode == "ram":
+                self._active_procs = ram_procs()
+            else:
+                self._active_procs = (self.last or {}).get("procs", [])
+        except Exception:
+            self._active_procs = []
+
+    def _fmt_val(self, val):
+        if self._proc_mode == "cpu":
+            return f"{val:.0f}%"
+        return f"{gb(val) * 1024:,.0f} MB"        # vram + ram both in MB
+
+    def _pids_for_name(self, name):
+        """All live pids whose exe base-name matches (for CPU/RAM kill, where the
+        per-tick rows carry no pids). Kill still re-validates each pid's name."""
+        key = name.lower()
+        return [pid for pid, nm in process_names().items()
+                if re.sub(r"\.exe$", "", nm, flags=re.IGNORECASE).lower() == key]
 
     def _minimize(self):
         self.root.update_idletasks()
@@ -1511,7 +1620,7 @@ class App:
         if e.width != self._plist_w:
             self._plist_w = e.width
             if self.last:
-                self._draw_procs(self.last["procs"])
+                self._draw_procs()
 
     def _plist_row_at(self, e):
         return int(self.plist.canvasy(e.y) // self.ROWH)
@@ -1528,17 +1637,23 @@ class App:
         if i != self._hover_i:
             self._hover_i = i
             if self.last:
-                self._draw_procs(self.last["procs"])
+                self._draw_procs()
 
     def _plist_click(self, e):
         w = self.plist.winfo_width()
         i = self._plist_row_at(e)
         if 0 <= i < len(self._proc_list) and e.x >= w - 26:
             name, val, pids, crit = self._proc_list[i]
-            if not crit and pids:
+            if crit:
+                return
+            if pids is None:                    # CPU/RAM row → resolve pids now
+                pids = self._pids_for_name(name)
+            if pids:
                 self._kill(name, pids)
 
-    def _draw_procs(self, procs):
+    def _draw_procs(self):
+        mode = self._proc_mode
+        procs = self._active_procs
         if self.filter:
             f = self.filter.lower()
             procs = [p for p in procs if f in p[0].lower()]
@@ -1549,22 +1664,31 @@ class App:
             w = 380
         self._proc_list = []
         if not procs:
+            if self.filter:
+                msg = "No match"
+            elif mode == "cpu":
+                msg = "Measuring CPU…"
+            elif mode == "ram":
+                msg = "No processes"
+            else:
+                msg = "No GPU memory in use"
             c.create_text(2, 14, anchor="w", fill=MUTED, font=self.f_small,
-                          text="No match" if self.filter else "No GPU memory in use")
+                          text=msg)
             c.configure(scrollregion=(0, 0, w, self.ROWH))
             return
         maxv = procs[0][1] or 1
         rh = self.ROWH
-        # Reserve the right end for the MB value (up to "16,384 MB") + the ✕,
-        # so the bar never runs under the number.
+        # Reserve the right end for the value (up to "16,384 MB") + the ✕, so the
+        # bar never runs under the number.
         xx = w - 12
         mbx = w - 30
         bx0, bx1 = 168, w - 104
+        show_growth = mode == "vram"
         for i, (name, val, pids) in enumerate(procs):
             crit = name.lower() in CRITICAL_PROCESSES
             self._proc_list.append((name, val, pids, crit))
             y = i * rh + rh / 2
-            if name in self._growing:
+            if show_growth and name in self._growing:
                 c.create_text(4, y, text="↑", anchor="w", fill=ACCENT_WARN,
                               font=self.f_mid)
             c.create_text(18, y, text=name[:22], anchor="w", fill=FG,
@@ -1576,7 +1700,7 @@ class App:
                 if fw > 2:
                     self._round_rect(c, bx0, y - 3, bx0 + fw, y + 3, 3,
                                      fill=ACCENT, outline="")
-            c.create_text(mbx, y, text=f"{gb(val) * 1024:,.0f} MB", anchor="e",
+            c.create_text(mbx, y, text=self._fmt_val(val), anchor="e",
                           fill=MUTED, font=self.f_mono)
             xcol = (GRID if crit else
                     ACCENT_HOT2 if i == self._hover_i else ACCENT_HOT)
@@ -1590,7 +1714,7 @@ class App:
         plural = "process" if n == 1 else f"{n} processes"
         if not messagebox.askyesno(
                 "End process",
-                f"End {name} ({plural}) and free its VRAM?\n\n"
+                f"End {name} ({plural})?\n\n"
                 f"This force-closes the app — any unsaved work will be lost.",
                 icon="warning", parent=self.root, default="no"):
             return
@@ -1709,9 +1833,10 @@ class App:
             return
         if self._ever_visible and not vis:
             return                        # minimised / hidden — skip the repaint
-        self.lbl_prochead.config(text=f"PROCESSES ({data.get('nproc', 0)})")
+        self._refresh_active_procs()
+        self.lbl_prochead.config(text=str(len(self._active_procs)))
         self._paint_cards()
-        self._draw_procs(data["procs"])
+        self._draw_procs()
 
     def _update_growth(self, procs):
         """Flag processes whose VRAM has climbed steadily over recent samples."""
