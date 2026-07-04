@@ -843,25 +843,43 @@ class App:
         self.cards.pack(side="left", fill="y")
         self.cards.bind("<Configure>", self._on_cards_resize)
 
-        # Right — processes card
-        card = tk.Frame(body, bg=PANEL)
-        card.pack(side="left", fill="both", expand=True, padx=(2, 14),
-                  pady=(8, 6))
+        # Right — processes card, drawn as a rounded PANEL on a background
+        # canvas so the whole panel has soft corners like the metric cards.
+        holder = tk.Frame(body, bg=BG)
+        holder.pack(side="left", fill="both", expand=True, padx=(2, 14),
+                    pady=(8, 6))
+        pbg = tk.Canvas(holder, bg=BG, highlightthickness=0, bd=0)
+        pbg.place(x=0, y=0, relwidth=1, relheight=1)
+        pbg.bind("<Configure>", lambda e: (
+            pbg.delete("all"),
+            self._round_rect(pbg, 1, 1, e.width - 1, e.height - 1, 14,
+                             fill=PANEL, outline="")))
+        card = tk.Frame(holder, bg=PANEL)
+        card.place(x=9, y=9, relwidth=1, relheight=1, width=-18, height=-18)
         phead = tk.Frame(card, bg=PANEL)
-        phead.pack(fill="x", padx=12, pady=(10, 4))
+        phead.pack(fill="x", padx=6, pady=(8, 4))
         self.lbl_prochead = tk.Label(phead, text="PROCESSES", bg=PANEL,
                                      fg=MUTED, font=self.f_small)
         self.lbl_prochead.pack(side="left")
-        self.search = tk.Entry(phead, bg=TRACK, fg=FG, insertbackground=FG,
-                               font=self.f_small, width=18, relief="flat",
-                               highlightthickness=1, highlightbackground=GRID,
-                               highlightcolor=ACCENT)
-        self.search.pack(side="right", ipady=2)
+        # rounded search box: a borderless Entry embedded in a small rounded
+        # canvas whose outline turns accent-coloured on focus.
+        sbox = tk.Canvas(phead, width=150, height=26, bg=PANEL,
+                         highlightthickness=0, bd=0)
+        sbox.pack(side="right")
+        self._search_box = sbox
+        self._draw_search_box(False)
+        self.search = tk.Entry(sbox, bg=TRACK, fg=FG, insertbackground=FG,
+                               font=self.f_small, relief="flat", bd=0,
+                               highlightthickness=0)
+        sbox.create_window(14, 13, window=self.search, anchor="w", width=126,
+                           height=18)
         self.search.bind("<KeyRelease>", self._on_search)
+        self.search.bind("<FocusIn>", lambda e: self._draw_search_box(True))
+        self.search.bind("<FocusOut>", lambda e: self._draw_search_box(False))
         tk.Label(phead, text="", bg=PANEL, fg=MUTED,
                  font=self.f_icon).pack(side="right", padx=(0, 6))
         lwrap = tk.Frame(card, bg=PANEL)
-        lwrap.pack(fill="both", expand=True, padx=(12, 6), pady=(0, 10))
+        lwrap.pack(fill="both", expand=True, padx=(6, 4), pady=(0, 8))
         # The process list is drawn as canvas ITEMS (not embedded widgets) — a
         # frame-of-widgets here made every window resize re-lay-out ~120 widgets
         # (~270 ms). Canvas items repaint in a few ms and scroll for free.
@@ -1062,6 +1080,16 @@ class App:
         if self.last:
             self._draw_procs(self.last["procs"])
 
+    def _draw_search_box(self, focused):
+        """Rounded backing for the search Entry; accent outline when focused.
+        (Embedded canvas windows always draw above items, so this stays behind
+        the Entry without needing an explicit lower.)"""
+        c = self._search_box
+        c.delete("box")
+        w, h = int(c["width"]), int(c["height"])
+        self._round_rect(c, 1, 1, w - 1, h - 1, 8, fill=TRACK,
+                         outline=ACCENT if focused else GRID, tags="box")
+
     def _minimize(self):
         self.root.update_idletasks()
         ctypes.windll.user32.ShowWindow(_hwnd(self.root), 6)   # SW_MINIMIZE
@@ -1136,20 +1164,47 @@ class App:
                      font=self.f_cap).pack(anchor="w", pady=(10, 2))
 
         def mkscale(frm, lo, hi, step, val, fmt, cb):
+            # Custom rounded slider (rounded track + circular thumb) — tk.Scale
+            # has a blocky trough/handle that can't be rounded.
             wrap = tk.Frame(frm, bg=BG)
             wrap.pack(fill="x")
             out = tk.Label(wrap, text=fmt(val), bg=BG, fg=FG, font=self.f_stat,
                            width=8, anchor="e")
             out.pack(side="right")
-            sc = tk.Scale(wrap, from_=lo, to=hi, resolution=step,
-                          orient="horizontal", showvalue=False, bg=BG, fg=FG,
-                          troughcolor=TRACK, highlightthickness=0, bd=0,
-                          activebackground=ACCENT, sliderrelief="flat",
-                          length=200)
-            sc.set(val)
+            sc = tk.Canvas(wrap, height=24, bg=BG, highlightthickness=0, bd=0)
             sc.pack(side="left", fill="x", expand=True)
-            sc.config(command=lambda v: (out.config(text=fmt(float(v))),
-                                         cb(float(v))))
+            st = {"v": float(val)}
+
+            def draw():
+                sc.delete("all")
+                w = sc.winfo_width() or 200
+                x0, x1, cy = 10, w - 10, 12
+                if x1 <= x0:
+                    return
+                frac = (st["v"] - lo) / (hi - lo) if hi > lo else 0
+                tx = x0 + (x1 - x0) * min(1, max(0, frac))
+                self._round_rect(sc, x0, cy - 3, x1, cy + 3, 3, fill=TRACK,
+                                 outline="")
+                if tx > x0 + 1:
+                    self._round_rect(sc, x0, cy - 3, tx, cy + 3, 3, fill=ACCENT,
+                                     outline="")
+                sc.create_oval(tx - 8, cy - 8, tx + 8, cy + 8, fill=ACCENT,
+                               outline=BG, width=2)
+
+            def setpx(px):
+                w = sc.winfo_width() or 200
+                x0, x1 = 10, w - 10
+                frac = min(1, max(0, (px - x0) / (x1 - x0))) if x1 > x0 else 0
+                v = min(hi, max(lo, round((lo + frac * (hi - lo)) / step) * step))
+                if v != st["v"]:
+                    st["v"] = v
+                    out.config(text=fmt(v))
+                    cb(v)
+                draw()
+
+            sc.bind("<Configure>", lambda e: draw())
+            sc.bind("<Button-1>", lambda e: setpx(e.x))
+            sc.bind("<B1-Motion>", lambda e: setpx(e.x))
             return sc
 
         cap("REFRESH RATE")
@@ -1166,8 +1221,9 @@ class App:
         sw = tk.Frame(pad, bg=BG)
         sw.pack(fill="x")
         for nm, cols in ACCENTS.items():
-            b = tk.Label(sw, bg=cols[0], width=3, height=1, cursor="hand2",
-                         relief="flat")
+            b = tk.Canvas(sw, width=28, height=22, bg=BG, highlightthickness=0,
+                          bd=0, cursor="hand2")
+            self._round_rect(b, 1, 1, 27, 21, 7, fill=cols[0], outline="")
             b.pack(side="left", padx=(0, 6))
             b.bind("<Button-1>", lambda e, n=nm: self._set_accent(n))
 
@@ -1175,21 +1231,45 @@ class App:
         self._v_temp = tk.BooleanVar(value=self.show_temp_pref)
         self._v_cpu = tk.BooleanVar(value=self.show_cpu)
 
-        def chk(text, var, key, attr):
-            def toggle():
+        def chk(text, var, key, attr, enabled=True):
+            # Rounded checkbox (canvas) + label — tk.Checkbutton's indicator is
+            # a hard square.
+            row = tk.Frame(pad, bg=BG)
+            row.pack(fill="x", pady=2)
+            cur = "hand2" if enabled else ""
+            box = tk.Canvas(row, width=20, height=20, bg=BG,
+                            highlightthickness=0, bd=0, cursor=cur)
+            box.pack(side="left")
+            lbl = tk.Label(row, text=text, bg=BG, fg=FG if enabled else GRID,
+                           font=self.f_mid, anchor="w", cursor=cur)
+            lbl.pack(side="left", padx=(8, 0))
+
+            def redraw():
+                box.delete("all")
+                on = var.get()
+                fill = ACCENT if (on and enabled) else TRACK
+                out = (ACCENT if on else GRID) if enabled else GRID
+                self._round_rect(box, 2, 2, 18, 18, 6, fill=fill, outline=out)
+                if on:
+                    box.create_line(6, 10, 9, 13, 14, 6,
+                                    fill=BG if enabled else GRID, width=2,
+                                    capstyle="round", joinstyle="round")
+
+            def toggle(e=None):
+                var.set(not var.get())
                 setattr(self, attr, var.get())
                 self.cfg.set(key, var.get())
+                redraw()
                 self._relayout()
-            c = tk.Checkbutton(pad, text=text, variable=var, command=toggle,
-                               bg=BG, fg=FG, selectcolor=PANEL, font=self.f_mid,
-                               activebackground=BG, activeforeground=FG,
-                               highlightthickness=0, bd=0, anchor="w")
-            c.pack(fill="x")
-            return c
-        tc = chk("GPU temperature card", self._v_temp, "show_temp",
-                 "show_temp_pref")
+
+            if enabled:
+                box.bind("<Button-1>", toggle)
+                lbl.bind("<Button-1>", toggle)
+            redraw()
+
+        chk("GPU temperature card", self._v_temp, "show_temp",
+            "show_temp_pref", enabled=self.sensors.ok)
         if not self.sensors.ok:
-            tc.config(state="disabled")
             tk.Label(pad, text="(temp sensors unavailable)", bg=BG, fg=MUTED,
                      font=self.f_cap).pack(anchor="w")
         chk("CPU / RAM card", self._v_cpu, "show_cpu", "show_cpu")
@@ -1197,7 +1277,7 @@ class App:
     def _set_accent(self, name):
         apply_accent(name)
         self.cfg.set("accent", name)
-        self.search.config(highlightcolor=ACCENT)
+        self._draw_search_box(self.search.focus_get() is self.search)
         self._paint_cards()
 
     def _open_log(self):
@@ -1723,6 +1803,7 @@ class App:
             sw, sh = t.winfo_screenwidth(), t.winfo_screenheight()
             t.geometry(f"+{sw - t.winfo_width() - 24}"
                        f"+{sh - t.winfo_height() - 60}")
+            _round_corners(t)              # soft corners on the toast
             t.after(4500, t.destroy)
         except Exception:
             pass
