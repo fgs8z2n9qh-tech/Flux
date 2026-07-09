@@ -21,6 +21,7 @@ import datetime
 import json
 import re
 import struct
+import subprocess
 import sys
 import os
 import threading
@@ -200,8 +201,12 @@ def terminate_pids(pids, expected_name):
     Returns (killed, denied, failed, skipped)."""
     expected = expected_name.lower()
     current = process_names()  # fresh snapshot at kill time
+    self_pid = os.getpid()
     killed = denied = failed = skipped = 0
     for pid in pids:
+        if int(pid) == self_pid:
+            skipped += 1            # never terminate Flux itself
+            continue
         name = current.get(int(pid))
         if name is None:
             skipped += 1            # process already exited
@@ -915,39 +920,75 @@ def _round_corners(win):
 
 
 def _app_dir():
-    """Folder of the running app (next to the exe when frozen)."""
+    """Folder of the running app (next to the exe when frozen) — READ-ONLY: it
+    can be non-writable (e.g. under Program Files, run without admin)."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def _migrate_legacy_file(new_name, old_name):
-    """One-time rename of a legacy vrameter_* data file to its flux_* name, so
-    the rebrand keeps the user's settings and leak-log (never orphan them)."""
-    d = _app_dir()
-    new, old = os.path.join(d, new_name), os.path.join(d, old_name)
-    if os.path.exists(old) and not os.path.exists(new):
+def _data_dir():
+    """Writable per-user data dir (%LOCALAPPDATA%\\Flux) for config/log/snapshots
+    — so writes never silently fail from an installed, non-admin app. Falls back
+    to the app dir only if that folder can't be created."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    d = os.path.join(base, "Flux")
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d
+    except OSError:
+        return _app_dir()
+
+
+def _migrate_data_file(name, *legacy_exe_names):
+    """Ensure `name` lives in _data_dir(); on first run move it there from the
+    app dir (under its current or a legacy vrameter_* name), so the user's
+    settings and leak-log migrate rather than being orphaned."""
+    new = os.path.join(_data_dir(), name)
+    if os.path.exists(new):
+        return
+    for old_name in (name,) + legacy_exe_names:
+        old = os.path.join(_app_dir(), old_name)
+        if old == new or not os.path.exists(old):
+            continue
         try:
             os.replace(old, new)
         except OSError:
-            pass
+            try:
+                with open(old, "rb") as src, open(new, "wb") as dst:
+                    dst.write(src.read())
+            except OSError:
+                pass
+        return
 
 
 class Config:
-    """Tiny JSON settings store kept next to the app."""
+    """Tiny JSON settings store in the per-user data dir, written atomically."""
     DEFAULTS = {"refresh_ms": 1000, "alert_pct": 90, "accent": "green",
                 "show_temp": True, "show_cpu": True, "show_net": True,
                 "geometry": None, "mini_geometry": None, "proc_mode": "vram"}
 
     def __init__(self):
-        _migrate_legacy_file("flux_config.json", "vrameter_config.json")
-        self.path = os.path.join(_app_dir(), "flux_config.json")
+        _migrate_data_file("flux_config.json", "vrameter_config.json")
+        self.path = os.path.join(_data_dir(), "flux_config.json")
         self.data = dict(self.DEFAULTS)
         try:
             with open(self.path, encoding="utf-8") as f:
-                self.data.update(json.load(f))
-        except Exception:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                self.data.update(loaded)
+        except FileNotFoundError:
             pass
+        except Exception:
+            # File exists but is unparseable (crash mid-write, BOM corruption…).
+            # Preserve it as .bad BEFORE defaults can overwrite it — never
+            # silently destroy a user config.
+            try:
+                bad = self.path + ".bad"
+                if not os.path.exists(bad):
+                    os.replace(self.path, bad)
+            except OSError:
+                pass
 
     def get(self, k):
         return self.data.get(k, self.DEFAULTS.get(k))
@@ -957,77 +998,166 @@ class Config:
         self.save()
 
     def save(self):
+        # Atomic: write a temp file, fsync, then os.replace() (atomic on NTFS) —
+        # an interrupted write can never truncate the live config.
         try:
-            with open(self.path, "w", encoding="utf-8") as f:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
         except Exception:
             pass
 
 
+def _clamp_int(v, default, lo, hi):
+    """Coerce a persisted config value to an int in [lo, hi], else `default`."""
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+CREATE_NO_WINDOW = 0x08000000
+
+
+def _lhm_sensor_dict(gpu):
+    """Map a LHM GPU hardware's sensors to the compact dict Flux displays."""
+    out = {}
+    for s in gpu.Sensors:
+        v = s.Value
+        if v is None:
+            continue
+        t, n = str(s.SensorType), s.Name
+        if t == "Temperature":
+            if n == "GPU Core":
+                out["temp"] = v
+            elif "Hot Spot" in n:
+                out["hotspot"] = v
+            elif n == "GPU Memory":
+                out["vramtemp"] = v
+        elif t == "Clock":
+            if n == "GPU Core":
+                out["coreclk"] = v
+            elif n == "GPU Memory":
+                out["memclk"] = v
+        elif t == "Power" and ("Package" in n or "Total" in n):
+            out["power"] = v
+        elif t == "Fan":
+            out["fan"] = v
+    return out
+
+
+def lhm_worker_main():
+    """CHILD-PROCESS entry point (`--lhm-worker`): load LibreHardwareMonitor via
+    pythonnet/CLR and stream GPU sensor JSON lines to stdout. Deliberately
+    isolated: a native access violation in the vendor GPU driver during a sensor
+    sweep is an uncatchable SEH — in-process it would kill the whole monitor
+    (documented failure of this exact library). Here it only kills the worker,
+    which the parent respawns."""
+    try:
+        dll = resource_path("LibreHardwareMonitorLib.dll")
+        d = os.path.dirname(dll)
+        try:
+            os.add_dll_directory(d)
+        except Exception:
+            pass
+        if d not in sys.path:
+            sys.path.append(d)
+        import clr
+        clr.AddReference(dll)
+        from LibreHardwareMonitor.Hardware import Computer
+        comp = Computer()
+        comp.IsGpuEnabled = True
+        comp.Open()
+        gpu = None
+        for hw in comp.Hardware:
+            if "Gpu" in str(hw.HardwareType):
+                gpu = hw
+                break
+        if gpu is None:
+            return
+    except Exception:
+        return
+    while True:
+        try:
+            gpu.Update()
+            line = (json.dumps(_lhm_sensor_dict(gpu)) + "\n").encode("utf-8")
+        except Exception:
+            line = b"{}\n"
+        try:
+            os.write(1, line)              # fd 1 == the pipe to the parent
+        except OSError:
+            return                         # parent gone → exit
+        time.sleep(2.0)                    # temps change slowly
+
+
 class GpuSensors:
-    """Optional GPU temperature / clocks / power / fan via LibreHardwareMonitor
-    (pythonnet). AMD/NVIDIA/Intel GPU sensors are read through the user-mode
-    driver, so no administrator rights are needed. Silently disables itself if
-    pythonnet or the DLLs aren't available — the app still runs without temps."""
+    """GPU temperature / clocks / power / fan via LibreHardwareMonitor — but run
+    in a CHILD PROCESS, never in this one. The main process MUST NOT import clr:
+    an LHM/pythonnet native access violation (e.g. during a GPU driver TDR) is an
+    uncatchable structured exception that would silently kill the whole app. The
+    worker streams sensor JSON; a reader thread keeps `self.data` current; read()
+    is non-blocking. If the worker dies (including a native crash) it's respawned
+    a few times, then temps just stay off — the monitor keeps running."""
 
     def __init__(self):
         self.ok = False
         self.data = {}
-        self._gpu = None
-        try:
-            dll = resource_path("LibreHardwareMonitorLib.dll")
-            d = os.path.dirname(dll)
+        self._lock = threading.Lock()
+        self._proc = None
+        self._stop = False
+        self._first = threading.Event()
+        threading.Thread(target=self._supervise, daemon=True).start()
+        self._first.wait(2.5)             # give the worker a moment to prove out
+
+    def _spawn(self):
+        args = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            args.append(os.path.abspath(__file__))
+        args.append("--lhm-worker")
+        return subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+
+    def _supervise(self):
+        deaths = 0
+        while not self._stop and deaths < 4:
             try:
-                os.add_dll_directory(d)
+                self._proc = self._spawn()
             except Exception:
-                pass
-            if d not in sys.path:
-                sys.path.append(d)
-            import clr
-            clr.AddReference(dll)
-            from LibreHardwareMonitor.Hardware import Computer
-            self._comp = Computer()
-            self._comp.IsGpuEnabled = True
-            self._comp.Open()
-            for hw in self._comp.Hardware:
-                if "Gpu" in str(hw.HardwareType):
-                    self._gpu = hw
+                break
+            for raw in self._proc.stdout:            # blocks per line
+                if self._stop:
                     break
-            self.ok = self._gpu is not None
-        except Exception as exc:
-            print("GPU sensors unavailable:", exc, file=sys.stderr)
+                try:
+                    d = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(d, dict):
+                    with self._lock:
+                        self.data = d
+                    self.ok = True
+                    self._first.set()
+            if self._stop:
+                break
+            deaths += 1
+            time.sleep(1.0)                           # backoff before respawn
+        self._first.set()                            # never leave __init__ hung
 
     def read(self):
-        if not self.ok:
-            return self.data
-        try:
-            self._gpu.Update()
-            out = {}
-            for s in self._gpu.Sensors:
-                v = s.Value
-                if v is None:
-                    continue
-                t, n = str(s.SensorType), s.Name
-                if t == "Temperature":
-                    if n == "GPU Core":
-                        out["temp"] = v
-                    elif "Hot Spot" in n:
-                        out["hotspot"] = v
-                    elif n == "GPU Memory":
-                        out["vramtemp"] = v
-                elif t == "Clock":
-                    if n == "GPU Core":
-                        out["coreclk"] = v
-                    elif n == "GPU Memory":
-                        out["memclk"] = v
-                elif t == "Power" and ("Package" in n or "Total" in n):
-                    out["power"] = v
-                elif t == "Fan":
-                    out["fan"] = v
-            self.data = out
-            return out
-        except Exception:
-            return self.data
+        with self._lock:
+            return dict(self.data)
+
+    def stop(self):
+        self._stop = True
+        p = self._proc
+        if p is not None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
 
 
 class _HotkeyThread(threading.Thread):
@@ -1091,12 +1221,15 @@ class App:
     def __init__(self, root):
         self.root = root
         self.cfg = Config()
-        apply_accent(self.cfg.get("accent"))
-        self.refresh_ms = int(self.cfg.get("refresh_ms"))
-        self.alert_pct = int(self.cfg.get("alert_pct"))
+        apply_accent(self.cfg.get("accent"))   # ignores an unknown accent name
+        # Coerce+clamp persisted values — a corrupt/hand-edited config must never
+        # crash startup (int(None)) or busy-loop the UI (after(0)).
+        self.refresh_ms = _clamp_int(self.cfg.get("refresh_ms"), 1000, 250, 5000)
+        self.alert_pct = _clamp_int(self.cfg.get("alert_pct"), 90, 50, 100)
         self.show_cpu = bool(self.cfg.get("show_cpu"))
         self.show_net = bool(self.cfg.get("show_net"))
         self.show_temp_pref = bool(self.cfg.get("show_temp"))
+        self._cfg_save_after = None            # debounced settings-save handle
 
         self.total, self.gpu_name = vram_total_bytes()
         self.hist_vram = deque([0.0] * HISTORY, maxlen=HISTORY)
@@ -1112,6 +1245,8 @@ class App:
         self.net_rx = self.net_tx = 0.0
         self._ncpu = os.cpu_count() or 1
         self._proc_mode = self.cfg.get("proc_mode")   # vram | cpu | ram | net
+        if self._proc_mode not in ("vram", "cpu", "ram", "net"):
+            self._proc_mode = "vram"
         self._active_procs = []                        # rows for the current mode
         self.net_etw = NetEtw()                        # per-process net (admin)
         self.sensors = GpuSensors()
@@ -1134,8 +1269,8 @@ class App:
         self._snap_cooldown = 0
         self._tickn = 0
         self._name_cache = {}            # pid -> exe name, for GPU-using pids
-        _migrate_legacy_file("flux_log.csv", "vrameter_log.csv")
-        self._log_path = os.path.join(_app_dir(), "flux_log.csv")
+        _migrate_data_file("flux_log.csv", "vrameter_log.csv")
+        self._log_path = os.path.join(_data_dir(), "flux_log.csv")
 
         self.temp_on = self.sensors.ok and self.show_temp_pref
 
@@ -1154,7 +1289,9 @@ class App:
         self._minw, self._minh = w, h
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         # Width is fixed by design; only the height + position are remembered.
-        m = re.match(r"\d+x(\d+)\+(-?\d+)\+(-?\d+)", self.cfg.get("geometry") or "")
+        geo = self.cfg.get("geometry")
+        m = re.match(r"\d+x(\d+)\+(-?\d+)\+(-?\d+)",
+                     geo if isinstance(geo, str) else "")
         if m:
             sv_h, x, yy = m.groups()
             root.geometry(f"{w}x{max(h, int(sv_h))}+{x}+{yy}")
@@ -1461,7 +1598,16 @@ class App:
         except Exception:
             pass
         self.net_etw.stop()               # never orphan the ETW session
+        self.sensors.stop()               # terminate the sensor worker process
         self.root.destroy()
+
+    def _cfg_debounced(self, key, val):
+        """Update a config value now, but coalesce the disk write (used by the
+        settings sliders so a drag is one atomic save, not dozens)."""
+        self.cfg.data[key] = val
+        if self._cfg_save_after:
+            self.root.after_cancel(self._cfg_save_after)
+        self._cfg_save_after = self.root.after(400, self.cfg.save)
 
     def _on_search(self, e=None):
         self.filter = self.search.get().strip()
@@ -1548,11 +1694,14 @@ class App:
         return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:,.0f} MB"
 
     def _pids_for_name(self, name):
-        """All live pids whose exe base-name matches (for CPU/RAM kill, where the
-        per-tick rows carry no pids). Kill still re-validates each pid's name."""
-        key = name.lower()
+        """All live pids whose exe base-name matches (for CPU/RAM/NET kill, where
+        the per-tick rows carry no pids), excluding Flux's own pid so ending a
+        shared name like 'python' can't take the monitor down with it. Kill still
+        re-validates each pid's name."""
+        key, me = name.lower(), os.getpid()
         return [pid for pid, nm in process_names().items()
-                if re.sub(r"\.exe$", "", nm, flags=re.IGNORECASE).lower() == key]
+                if pid != me
+                and re.sub(r"\.exe$", "", nm, flags=re.IGNORECASE).lower() == key]
 
     def _minimize(self):
         self.root.update_idletasks()
@@ -1676,11 +1825,11 @@ class App:
         mkscale(pad, 250, 5000, 250, self.refresh_ms,
                 lambda v: f"{v/1000:.2f}s",
                 lambda v: (setattr(self, "refresh_ms", int(v)),
-                           self.cfg.set("refresh_ms", int(v))))
+                           self._cfg_debounced("refresh_ms", int(v))))
         cap("ALERT THRESHOLD")
         mkscale(pad, 50, 100, 1, self.alert_pct, lambda v: f"{v:.0f}%",
                 lambda v: (setattr(self, "alert_pct", int(v)),
-                           self.cfg.set("alert_pct", int(v))))
+                           self._cfg_debounced("alert_pct", int(v))))
 
         cap("ACCENT")
         sw = tk.Frame(pad, bg=BG)
@@ -2261,11 +2410,16 @@ class App:
             self._ever_visible = True
         log_now = self._tickn % LOG_EVERY == 1
 
-        # GPU sensors (temp/clocks/power) — a ~15 ms LHM read; only when they'll
-        # be shown or logged soon, and only every 3rd tick (they change slowly).
-        if self.sensors.ok and (vis or log_now) and self._tickn % 3 == 0:
+        # GPU sensors: read() is now a non-blocking fetch of the latest dict the
+        # isolated worker process sent (the CLR sweep no longer runs here), so we
+        # can just read it every tick.
+        if self.sensors.ok:
             self.sensors_data = self.sensors.read()
         self.hist_temp.append(self.sensors_data.get("temp", 0) or 0)
+        # The worker may come online (or die) after startup — show/hide the temp
+        # card and resize to match when its availability changes.
+        if (self.sensors.ok and self.show_temp_pref) != self.temp_on and vis:
+            self._relayout()
 
         # session peak
         if used > self._peak:
@@ -2340,7 +2494,7 @@ class App:
         """Write a full all-process snapshot to a timestamped file."""
         try:
             ts = datetime.datetime.now()
-            path = os.path.join(_app_dir(),
+            path = os.path.join(_data_dir(),
                                 f"flux_snapshot_{ts:%Y%m%d_%H%M%S}.txt")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(f"Flux snapshot ({tag})  {ts:%Y-%m-%d %H:%M:%S}\n")
@@ -2385,9 +2539,11 @@ class App:
             with open(self._log_path, encoding="utf-8") as f:
                 lines = f.readlines()
             if len(lines) > 20000:
-                with open(self._log_path, "w", encoding="utf-8") as f:
+                tmp = self._log_path + ".tmp"          # atomic rewrite
+                with open(tmp, "w", encoding="utf-8") as f:
                     f.writelines(lines[:1])            # header
                     f.writelines(lines[-20000:])
+                os.replace(tmp, self._log_path)
         except Exception:
             pass
 
@@ -2441,4 +2597,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--lhm-worker" in sys.argv:
+        lhm_worker_main()          # isolated GPU-sensor child process
+    else:
+        main()
