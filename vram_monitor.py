@@ -461,6 +461,10 @@ CPU_COUNTER = r"\Processor(_Total)\% Processor Time"
 # Per-process "mini task manager" views — all via PDH, no new dependencies.
 PROC_CPU_COUNTER = r"\Process(*)\% Processor Time"        # rate (0..100*ncpu)
 PROC_RAM_COUNTER = r"\Process(*)\Working Set - Private"   # instantaneous bytes
+# Per-process I/O throughput. Note: "IO Data Bytes/sec" is ALL I/O the process
+# issues (file + device + network) — Windows has no per-process disk-only PDH
+# counter without ETW/admin. This matches Task Manager's "Disk" column.
+PROC_DISK_COUNTER = r"\Process(*)\IO Data Bytes/sec"       # rate (bytes/sec)
 _PROC_INST_SKIP = {"_total", "idle"}                      # PDH pseudo-instances
 _HASHNUM_RE = re.compile(r"#\d+$")
 
@@ -491,6 +495,16 @@ def cpu_procs(sampler, ncpu):
 def ram_procs():
     """[(name, private_working_set_bytes, None), ...] biggest first."""
     agg = _agg_proc_by_name(read_counter_instances(PROC_RAM_COUNTER))
+    procs = [(n, v, None) for n, v in agg.items() if v > 0]
+    procs.sort(key=lambda t: t[1], reverse=True)
+    return procs
+
+
+def disk_procs(sampler):
+    """[(name, io_bytes_per_sec, None), ...] busiest first. Rate counter, so it
+    reads through RateSampler (primes on first read, data one tick later) — same
+    shape as cpu_procs/ram_procs, so the row renderer and kill path are reused."""
+    agg = _agg_proc_by_name(sampler.read())
     procs = [(n, v, None) for n, v in agg.items() if v > 0]
     procs.sort(key=lambda t: t[1], reverse=True)
     return procs
@@ -1240,12 +1254,13 @@ class App:
         self.gpu_sampler = RateSampler(GPU_ENGINE_COUNTER)
         self.cpu_sampler = RateSampler(CPU_COUNTER)
         self.proc_cpu_sampler = RateSampler(PROC_CPU_COUNTER)  # per-process CPU
+        self.proc_disk_sampler = RateSampler(PROC_DISK_COUNTER)  # per-process I/O
         self.net_rx_sampler = RateSampler(NET_RX_COUNTER)
         self.net_tx_sampler = RateSampler(NET_TX_COUNTER)
         self.net_rx = self.net_tx = 0.0
         self._ncpu = os.cpu_count() or 1
-        self._proc_mode = self.cfg.get("proc_mode")   # vram | cpu | ram | net
-        if self._proc_mode not in ("vram", "cpu", "ram", "net"):
+        self._proc_mode = self.cfg.get("proc_mode")   # vram|cpu|ram|net|disk
+        if self._proc_mode not in ("vram", "cpu", "ram", "net", "disk"):
             self._proc_mode = "vram"
         self._active_procs = []                        # rows for the current mode
         self.net_etw = NetEtw()                        # per-process net (admin)
@@ -1370,8 +1385,8 @@ class App:
         card.place(x=9, y=9, relwidth=1, relheight=1, width=-18, height=-18)
         phead = tk.Frame(card, bg=PANEL)
         phead.pack(fill="x", padx=6, pady=(8, 5))
-        # segmented VRAM / CPU / RAM / NET selector — the "mini task manager"
-        self._seg = tk.Canvas(phead, width=176, height=24, bg=PANEL,
+        # segmented VRAM / CPU / RAM / NET / DISK selector — "mini task manager"
+        self._seg = tk.Canvas(phead, width=205, height=24, bg=PANEL,
                               highlightthickness=0, bd=0, cursor="hand2")
         self._seg.pack(side="left")
         self._seg.bind("<Button-1>", self._seg_click)
@@ -1626,7 +1641,7 @@ class App:
 
     # -- process view selector (VRAM / CPU / RAM / NET) -------------------- #
     _PROC_MODES = [("vram", "VRAM"), ("cpu", "CPU"), ("ram", "RAM"),
-                   ("net", "NET")]
+                   ("net", "NET"), ("disk", "DISK")]
 
     def _draw_seg(self):
         """Segmented pill selector; the active mode gets an accent-filled pill."""
@@ -1680,6 +1695,8 @@ class App:
                     self.net_etw.start()          # lazy start (persisted NET mode)
                 self._active_procs = (net_procs(self.net_etw)
                                       if self.net_etw.ok else [])
+            elif self._proc_mode == "disk":
+                self._active_procs = disk_procs(self.proc_disk_sampler)
             else:
                 self._active_procs = (self.last or {}).get("procs", [])
         except Exception:
@@ -1690,6 +1707,8 @@ class App:
             return f"{val:.0f}%"
         if self._proc_mode == "net":
             return fmt_bits(val)
+        if self._proc_mode == "disk":                  # bytes/sec, not bits
+            return f"{val / 1e9:.2f} GB/s" if val >= 1e9 else f"{val / 1e6:.1f} MB/s"
         mb = gb(val) * 1024                        # vram + ram: GB once it's big
         return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:,.0f} MB"
 
@@ -2267,6 +2286,8 @@ class App:
                 msg = "Measuring CPU…"
             elif mode == "net":
                 msg = "Measuring network…"
+            elif mode == "disk":
+                msg = "Measuring disk…"
             elif mode == "ram":
                 msg = "No processes"
             else:
