@@ -78,50 +78,70 @@ for _f in (pdh.PdhOpenQueryW, pdh.PdhAddEnglishCounterW,
     _f.restype = wintypes.DWORD
 
 
+# Wildcard queries are kept open between calls, keyed by counter path.
+_INST_QUERIES = {}
+
+
+def _drop_inst_query(counter_path):
+    qc = _INST_QUERIES.pop(counter_path, None)
+    if qc is not None:
+        pdh.PdhCloseQuery(qc[0])
+
+
 def read_counter_instances(counter_path):
     """Return [(instance_name, value_int), ...] for a wildcard counter path.
 
-    Opens a fresh query each call so newly-started processes are always picked
-    up (PDH expands wildcards at add-time, so a persistent query goes stale)."""
-    query = wintypes.HANDLE()
-    if pdh.PdhOpenQueryW(None, None, ctypes.byref(query)) != ERROR_SUCCESS:
-        return []
-    try:
+    The query is kept OPEN between calls. Measured against the old belief that
+    a persistent wildcard query goes stale: run side by side with a fresh query
+    over 14 ticks while processes were spawned and killed, the two instance
+    sets never disagreed — on \\Process(*), \\GPU Process Memory(*),
+    \\GPU Adapter Memory(*) and \\GPU Engine(*) alike. Reopening cost 36 ms
+    vs 7 ms per call across ~390 \\Process(*) instances, on the UI thread, so
+    the query is now only reopened to self-heal a failed collect."""
+    qc = _INST_QUERIES.get(counter_path)
+    if qc is None:
+        query = wintypes.HANDLE()
+        if pdh.PdhOpenQueryW(None, None, ctypes.byref(query)) != ERROR_SUCCESS:
+            return []
         counter = wintypes.HANDLE()
         if pdh.PdhAddEnglishCounterW(query, counter_path, None,
                                      ctypes.byref(counter)) != ERROR_SUCCESS:
+            pdh.PdhCloseQuery(query)
             return []
-        # Memory counters are instantaneous; two back-to-back collects (no
-        # sleep) guarantee a formatted value is available.
+        # Instantaneous counters need a prior collect for a formatted value;
+        # after this priming one collect per call is enough.
         pdh.PdhCollectQueryData(query)
-        pdh.PdhCollectQueryData(query)
+        qc = _INST_QUERIES[counter_path] = (query, counter)
 
-        size = wintypes.DWORD(0)
-        count = wintypes.DWORD(0)
-        status = pdh.PdhGetFormattedCounterArrayW(
-            counter, PDH_FMT_LARGE, ctypes.byref(size),
-            ctypes.byref(count), None)
-        if status != PDH_MORE_DATA or size.value == 0:
-            return []
+    query, counter = qc
+    if pdh.PdhCollectQueryData(query) != ERROR_SUCCESS:
+        _drop_inst_query(counter_path)        # the next call re-opens it
+        return []
 
-        buf = (ctypes.c_byte * size.value)()
-        status = pdh.PdhGetFormattedCounterArrayW(
-            counter, PDH_FMT_LARGE, ctypes.byref(size),
-            ctypes.byref(count), buf)
-        if status != ERROR_SUCCESS:
-            return []
+    size = wintypes.DWORD(0)
+    count = wintypes.DWORD(0)
+    status = pdh.PdhGetFormattedCounterArrayW(
+        counter, PDH_FMT_LARGE, ctypes.byref(size),
+        ctypes.byref(count), None)
+    if status != PDH_MORE_DATA or size.value == 0:
+        return []
 
-        items = ctypes.cast(
-            buf, ctypes.POINTER(PDH_FMT_COUNTERVALUE_ITEM_W * count.value)
-        ).contents
-        out = []
-        for it in items:
-            if it.FmtValue.CStatus in (PDH_CSTATUS_VALID_DATA,
-                                       PDH_CSTATUS_NEW_DATA):
-                out.append((it.szName, int(it.FmtValue.largeValue)))
-        return out
-    finally:
-        pdh.PdhCloseQuery(query)
+    buf = (ctypes.c_byte * size.value)()
+    status = pdh.PdhGetFormattedCounterArrayW(
+        counter, PDH_FMT_LARGE, ctypes.byref(size),
+        ctypes.byref(count), buf)
+    if status != ERROR_SUCCESS:
+        return []
+
+    items = ctypes.cast(
+        buf, ctypes.POINTER(PDH_FMT_COUNTERVALUE_ITEM_W * count.value)
+    ).contents
+    out = []
+    for it in items:
+        if it.FmtValue.CStatus in (PDH_CSTATUS_VALID_DATA,
+                                   PDH_CSTATUS_NEW_DATA):
+            out.append((it.szName, int(it.FmtValue.largeValue)))
+    return out
 
 
 # ---- Process name lookup via Toolhelp32 snapshot --------------------------- #
@@ -385,8 +405,11 @@ def _read_double_array(counter):
 
 class RateSampler:
     """Reads a wildcard *rate* counter (utilization), which needs two samples a
-    refresh apart. Keeps a query primed from the previous tick and opens a fresh
-    one each read, so newly-started processes appear with one tick of latency."""
+    refresh apart, so the query stays primed between reads. Measured, against
+    the old belief that wildcards go stale: a persistent query DOES pick up
+    processes started after it was added (on the next collect) and drops dead
+    ones — and reopening it every read cost 32.5 ms vs 8.3 ms across ~390
+    \\Process(*) instances. So it is only reopened to self-heal a failure."""
 
     def __init__(self, path):
         self.path = path
@@ -405,14 +428,15 @@ class RateSampler:
         return (q, c)
 
     def read(self):
-        out = []
-        if self._primed is not None:
-            q, c = self._primed
-            if pdh.PdhCollectQueryData(q) == ERROR_SUCCESS:
-                out = _read_double_array(c)
-            pdh.PdhCloseQuery(q)
-        self._primed = self._open_primed()
-        return out
+        if self._primed is None:
+            self._primed = self._open_primed()
+            return []                     # the first read only primes the query
+        q, c = self._primed
+        if pdh.PdhCollectQueryData(q) != ERROR_SUCCESS:
+            pdh.PdhCloseQuery(q)          # drop it; the next read re-primes
+            self._primed = None
+            return []
+        return _read_double_array(c)
 
 
 def gpu_utilization(sampler):
@@ -717,7 +741,9 @@ class NetEtw:
         self._h = TRACEHANDLE(0)
         self._th = 0
         self._thread = None
-        self._cb = None
+        # Bound once and held for the object's lifetime: rebinding this in
+        # start() frees a trampoline a timed-out pump thread may still call.
+        self._cb = _EVENT_RECORD_CALLBACK(self._on_event)
         self._lock = threading.Lock()
         self._acc = {}
         self._last_t = None
@@ -762,7 +788,6 @@ class NetEtw:
             self.admin_needed = en == 5
             advapi32.ControlTraceW(self._h, self.SESSION, p, _CTRL_STOP)
             return False
-        self._cb = _EVENT_RECORD_CALLBACK(self._on_event)
         lf = _EVENT_TRACE_LOGFILE()
         lf.LoggerName = self.SESSION
         lf.ProcessTraceMode = _PTM_REAL_TIME | _PTM_EVENT_RECORD
@@ -841,22 +866,25 @@ ACCENT_HOT  = "#f87171"   # red (✕ buttons)
 ACCENT_HOT2 = "#ff5a5a"   # brighter red (✕ hover)
 GPU_LINE    = "#5eead4"   # teal — GPU-load history line
 
-# Selectable accent themes: (accent, scrollbar-dim, secondary-line)
+# Selectable accent themes: (accent, scrollbar-dim, secondary-line, warn, hot).
+# warn/hot are per-theme so the state colours never collide with the accent —
+# e.g. the amber theme's warn shifts to orange (plain amber IS its accent),
+# and pink's hot shifts to a pure red distinct from the pink accent.
 ACCENTS = {
-    "green":  ("#34d399", "#1f8a66", "#5eead4"),
-    "blue":   ("#38bdf8", "#1e6f99", "#7dd3fc"),
-    "purple": ("#a78bfa", "#6d51c4", "#c4b5fd"),
-    "pink":   ("#f472b6", "#9d3a73", "#f9a8d4"),
-    "amber":  ("#fbbf24", "#a87c12", "#fcd34d"),
-    "cyan":   ("#22d3ee", "#157f8f", "#67e8f9"),
+    "green":  ("#34d399", "#1f8a66", "#5eead4", "#fbbf24", "#f87171"),
+    "blue":   ("#38bdf8", "#1e6f99", "#7dd3fc", "#fbbf24", "#f87171"),
+    "purple": ("#a78bfa", "#6d51c4", "#c4b5fd", "#fbbf24", "#f87171"),
+    "pink":   ("#f472b6", "#9d3a73", "#f9a8d4", "#fbbf24", "#ef4444"),
+    "amber":  ("#fbbf24", "#a87c12", "#fcd34d", "#fb923c", "#f87171"),
+    "cyan":   ("#22d3ee", "#157f8f", "#67e8f9", "#fbbf24", "#f87171"),
 }
 
 
 def apply_accent(name):
     """Swap the accent colour globally (canvas elements re-read it each paint)."""
-    global ACCENT, ACCENT_DIM, GPU_LINE
-    if name in ACCENTS:
-        ACCENT, ACCENT_DIM, GPU_LINE = ACCENTS[name]
+    global ACCENT, ACCENT_DIM, GPU_LINE, ACCENT_WARN, ACCENT_HOT
+    if isinstance(name, str) and name in ACCENTS:
+        ACCENT, ACCENT_DIM, GPU_LINE, ACCENT_WARN, ACCENT_HOT = ACCENTS[name]
 
 REFRESH_MS = 1000
 HISTORY = 120
@@ -883,12 +911,49 @@ def fmt_bits(bytes_per_sec):
     return f"{bits:.0f} bps"
 
 
+def split_bits(bytes_per_sec):
+    """fmt_bits split into (number, unit) so the number can carry the weight
+    and the unit can whisper next to it."""
+    num, _, unit = fmt_bits(bytes_per_sec).rpartition(" ")
+    return num, unit
+
+
 def usage_color(pct):
+    """Colour for GRAPHIC fills (bars) — accent while healthy."""
     if pct >= 90:
         return ACCENT_HOT
     if pct >= 70:
         return ACCENT_WARN
     return ACCENT
+
+
+def state_color(pct, lo=70, hi=90):
+    """Colour for NUMBERS: quiet (FG) while healthy — colour on a value means
+    something is wrong, so it has to be earned by live state."""
+    if pct >= hi:
+        return ACCENT_HOT
+    if pct >= lo:
+        return ACCENT_WARN
+    return FG
+
+
+def temp_color(t, lo=80, hi=92):
+    return state_color(t, lo, hi)
+
+
+def _rect_on_a_monitor(x, y, w, h):
+    """True when the rect overlaps a live monitor. A saved window position can
+    point at a display that no longer exists (unplugged, undocked, a new GPU or
+    board changing the layout) — and an overrideredirect window has no title bar
+    to drag back with, so validate one before restoring it."""
+    try:
+        u = ctypes.windll.user32
+        u.MonitorFromRect.restype = ctypes.c_void_p     # HMONITOR is a pointer
+        r = wintypes.RECT(int(x), int(y), int(x + w), int(y + h))
+        # MONITOR_DEFAULTTONULL = 0 -> NULL when the rect is on no monitor
+        return bool(u.MonitorFromRect(ctypes.byref(r), 0))
+    except Exception:
+        return True                       # never block startup on this check
 
 
 def _hwnd(root):
@@ -1029,7 +1094,7 @@ def _clamp_int(v, default, lo, hi):
     """Coerce a persisted config value to an int in [lo, hi], else `default`."""
     try:
         return max(lo, min(hi, int(v)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # 1e999 -> inf -> int()
         return default
 
 
@@ -1158,6 +1223,10 @@ class GpuSensors:
                 break
             deaths += 1
             time.sleep(1.0)                           # backoff before respawn
+        if not self._stop:        # gave up for good — stop reporting a frozen
+            self.ok = False       # reading as if it were live (the temp card
+            with self._lock:      # then hides instead of flatlining)
+                self.data = {}
         self._first.set()                            # never leave __init__ hung
 
     def read(self):
@@ -1170,8 +1239,12 @@ class GpuSensors:
         if p is not None:
             try:
                 p.terminate()
+                p.wait(timeout=1)
             except Exception:
-                pass
+                try:
+                    p.kill()              # wedged in a native call
+                except Exception:
+                    pass
 
 
 class _HotkeyThread(threading.Thread):
@@ -1307,24 +1380,31 @@ class App:
         geo = self.cfg.get("geometry")
         m = re.match(r"\d+x(\d+)\+(-?\d+)\+(-?\d+)",
                      geo if isinstance(geo, str) else "")
-        if m:
-            sv_h, x, yy = m.groups()
-            root.geometry(f"{w}x{max(h, int(sv_h))}+{x}+{yy}")
+        # Check the 40px drag strip, not the whole window: that also catches a
+        # window dragged mostly off the bottom, where the only handle is gone.
+        if m and _rect_on_a_monitor(int(m.group(2)) + 8, int(m.group(3)),
+                                    w - 16, 40):
+            root.geometry(f"{w}x{max(h, int(m.group(1)))}"
+                          f"+{m.group(2)}+{m.group(3)}")
         else:
             root.geometry(f"{w}x{h}+{max(0,(sw-w)//2)}+{max(0,(sh-h)//3)}")
         root.overrideredirect(True)          # remove the native title bar
+        # Alt+F4 / taskbar "Close window" would otherwise destroy the window
+        # without stopping the machine-wide ETW session or saving geometry.
+        root.protocol("WM_DELETE_WINDOW", self._close)
 
         self.f_cap = tkfont.Font(family="Segoe UI", size=8)
         self.f_title = tkfont.Font(family="Segoe UI Semibold", size=12)
         self.f_titlebar = tkfont.Font(family="Segoe UI Semibold", size=10)
         self.f_icon = tkfont.Font(family="Segoe MDL2 Assets", size=10)
         self.f_huge = tkfont.Font(family="Segoe UI", size=34, weight="bold")
-        self.f_pct = tkfont.Font(family="Segoe UI", size=21, weight="bold")
+        self.f_pct = tkfont.Font(family="Segoe UI", size=16, weight="bold")
         self.f_cardnum = tkfont.Font(family="Segoe UI", size=22, weight="bold")
         self.f_mid = tkfont.Font(family="Segoe UI", size=10)
         self.f_stat = tkfont.Font(family="Segoe UI Semibold", size=13)
         self.f_small = tkfont.Font(family="Segoe UI", size=9)
         self.f_mono = tkfont.Font(family="Consolas", size=9)
+        self._fmet = {}                    # font-metrics cache for _bignum
 
         # Custom title bar (replaces the OS one) ---------------------------- #
         self._pinned = False
@@ -1333,12 +1413,15 @@ class App:
         tb.pack(fill="x", side="top")
         tb.pack_propagate(False)
         # Flux mark: two flowing waves (echoes the app icon), in the accent hue
-        logo = tk.Canvas(tb, width=22, height=20, bg=BG, highlightthickness=0)
+        logo = self._logo = tk.Canvas(tb, width=22, height=20, bg=BG,
+                                      highlightthickness=0)
         logo.pack(side="left", padx=(14, 8))
-        logo.create_line(1, 8, 6, 5, 11, 8, 16, 11, 21, 8,
-                         fill=GPU_LINE, width=2, smooth=True, capstyle="round")
-        logo.create_line(1, 13, 6, 10, 11, 13, 16, 16, 21, 13,
-                         fill=ACCENT, width=2, smooth=True, capstyle="round")
+        self._logo_hi = logo.create_line(
+            1, 8, 6, 5, 11, 8, 16, 11, 21, 8,
+            fill=GPU_LINE, width=2, smooth=True, capstyle="round")
+        self._logo_lo = logo.create_line(
+            1, 13, 6, 10, 11, 13, 16, 16, 21, 13,
+            fill=ACCENT, width=2, smooth=True, capstyle="round")
         title = tk.Label(tb, text="Flux", bg=BG, fg=FG,
                          font=self.f_titlebar)
         title.pack(side="left")
@@ -1369,6 +1452,10 @@ class App:
                                bg=BG)
         self.cards.pack(side="left", fill="y")
         self.cards.bind("<Configure>", self._on_cards_resize)
+        # the left column was dead surface — now each card jumps to its view
+        self.cards.bind("<Motion>", self._cards_motion)
+        self.cards.bind("<Leave>", lambda e: self._cards_motion(None))
+        self.cards.bind("<Button-1>", self._cards_click)
 
         # Right — processes card, drawn as a rounded PANEL on a background
         # canvas so the whole panel has soft corners like the metric cards.
@@ -1391,12 +1478,13 @@ class App:
         self._seg.pack(side="left")
         self._seg.bind("<Button-1>", self._seg_click)
         self._draw_seg()
+        self._phead = phead
         self.lbl_prochead = tk.Label(phead, text="", bg=PANEL, fg=MUTED,
-                                     font=self.f_cap, width=4, anchor="w")
+                                     font=self.f_cap, anchor="w")
         self.lbl_prochead.pack(side="left", padx=(8, 0))
         # rounded search box: a borderless Entry embedded in a small rounded
         # canvas whose outline turns accent-coloured on focus.
-        sbox = tk.Canvas(phead, width=116, height=26, bg=PANEL,
+        sbox = tk.Canvas(phead, width=80, height=26, bg=PANEL,
                          highlightthickness=0, bd=0)
         sbox.pack(side="right")
         self._search_box = sbox
@@ -1404,7 +1492,7 @@ class App:
         self.search = tk.Entry(sbox, bg=TRACK, fg=FG, insertbackground=FG,
                                font=self.f_small, relief="flat", bd=0,
                                highlightthickness=0)
-        sbox.create_window(12, 13, window=self.search, anchor="w", width=94,
+        sbox.create_window(10, 13, window=self.search, anchor="w", width=62,
                            height=18)
         self.search.bind("<KeyRelease>", self._on_search)
         self.search.bind("<FocusIn>", lambda e: self._draw_search_box(True))
@@ -1428,6 +1516,10 @@ class App:
         self._show_growth = False
         self._xitems = {}             # {row: ✕ canvas id} for VISIBLE rows only
         self._hover_i = -1
+        self._card_regions = []          # (x0,y0,x1,y1,mode,item) hit targets
+        self._card_hover = None          # hovered card's MODE (survives repaint)
+        self._seg_anim = None            # pill-slide after() handle
+        self._hover_xf = False           # cursor directly over a ✕ mark
         self.plist.bind_all("<MouseWheel>", self._on_wheel)
         self.plist.bind("<Configure>", self._on_plist_config)
         self.plist.bind("<Button-1>", self._plist_click)
@@ -1448,6 +1540,7 @@ class App:
         self.mini.title("Flux mini")
         self.mini.withdraw()
         self.mini.overrideredirect(True)
+        self.mini.protocol("WM_DELETE_WINDOW", self._close)
         self.mini.attributes("-topmost", True)
         self.mini.configure(bg=BG)
         self.mini.geometry("360x44")
@@ -1566,16 +1659,44 @@ class App:
         if fw > 2:
             self._round_rect(c, x, y - 3, x + fw, y + 3, 3, fill=col)
         x += bw + 9
-        x = txt(x, f"{pct:.0f}%", col, fs) + 13
+        x = txt(x, f"{pct:.0f}%", state_color(pct), fs) + 13
         x = txt(x, f"GPU {gpu:.0f}%", MUTED, fsm) + 11
         if temp is not None:
-            tcol = (ACCENT if temp < 75 else
-                    ACCENT_WARN if temp < 85 else ACCENT_HOT)
-            txt(x, f"{temp:.0f}°", tcol, fsm)
+            txt(x, f"{temp:.0f}°", temp_color(temp), fsm)
 
     def _on_wheel(self, e):
         self.plist.yview_scroll(int(-e.delta / 120), "units")
         self._redraw_rows()                         # virtualize on wheel-scroll
+
+    def _card_at(self, e):
+        if e is None:
+            return None
+        for x0, y0, x1, y1, mode, item in self._card_regions:
+            if x0 <= e.x <= x1 and y0 <= e.y <= y1:
+                return (mode, item)
+        return None
+
+    def _cards_motion(self, e):
+        """Recolour just the hovered card in place — no repaint (the same trick
+        the process list uses for its row highlight)."""
+        hit = self._card_at(e)
+        mode = hit[0] if hit else None
+        if mode == self._card_hover:
+            return
+        c = self.cards
+        for x0, y0, x1, y1, m, item in self._card_regions:
+            if m in (mode, self._card_hover):
+                try:
+                    c.itemconfig(item, fill=PANEL_HOVER if m == mode else PANEL)
+                except tk.TclError:
+                    pass
+        self._card_hover = mode
+        c.config(cursor="hand2" if mode else "")
+
+    def _cards_click(self, e):
+        hit = self._card_at(e)
+        if hit:
+            self._set_proc_mode(hit[0])
 
     def _on_cards_resize(self, e):
         # Throttle resize repaints to ~30 fps: paint now if enough time has
@@ -1610,6 +1731,8 @@ class App:
         try:
             if not self._maxed:
                 self.cfg.set("geometry", self.root.geometry())
+            elif self._cfg_save_after:
+                self.cfg.save()           # flush a pending debounced write
         except Exception:
             pass
         self.net_etw.stop()               # never orphan the ETW session
@@ -1643,21 +1766,40 @@ class App:
     _PROC_MODES = [("vram", "VRAM"), ("cpu", "CPU"), ("ram", "RAM"),
                    ("net", "NET"), ("disk", "DISK")]
 
-    def _draw_seg(self):
-        """Segmented pill selector; the active mode gets an accent-filled pill."""
+    def _draw_seg(self, pill=None):
+        """Segmented pill selector; the active mode gets an accent-filled pill.
+        `pill` is a FRACTIONAL segment index so the pill can be mid-slide."""
         c = self._seg
         c.delete("all")
         w, h = int(c["width"]), int(c["height"])
-        seg = w / len(self._PROC_MODES)
+        n = len(self._PROC_MODES)
+        seg = w / n
+        if pill is None:
+            pill = self._mode_index(self._proc_mode)
         self._round_rect(c, 0, 0, w, h, 7, fill=TRACK, outline="")
+        px = pill * seg
+        self._round_rect(c, px + 2, 2, px + seg - 2, h - 2, 6,
+                         fill=ACCENT, outline="")
+        lit = int(round(pill))           # label flips as the pill passes it
         for i, (mode, label) in enumerate(self._PROC_MODES):
-            x0 = i * seg
-            active = mode == self._proc_mode
-            if active:
-                self._round_rect(c, x0 + 2, 2, x0 + seg - 2, h - 2, 6,
-                                 fill=ACCENT, outline="")
-            c.create_text(x0 + seg / 2, h / 2, text=label, anchor="center",
-                          fill=BG if active else MUTED, font=self.f_small)
+            c.create_text(i * seg + seg / 2, h / 2, text=label, anchor="center",
+                          fill=BG if i == lit else MUTED, font=self.f_small)
+
+    def _mode_index(self, mode):
+        return next((i for i, (m, _) in enumerate(self._PROC_MODES)
+                     if m == mode), 0)
+
+    def _anim_seg(self, frm, to, step=1):
+        """Slide the pill over ~8 eased frames. Runs only on click, and moves
+        one polygon per frame, so it stays well inside the repaint budget."""
+        if self._seg_anim is not None:
+            self.root.after_cancel(self._seg_anim)
+            self._seg_anim = None
+        t = min(1.0, step / 8.0)
+        self._draw_seg(frm + (to - frm) * (1 - (1 - t) ** 3))
+        if step < 8:
+            self._seg_anim = self.root.after(15, self._anim_seg,
+                                             frm, to, step + 1)
 
     def _seg_click(self, e):
         seg = int(self._seg["width"]) / len(self._PROC_MODES)
@@ -1673,14 +1815,36 @@ class App:
                 self.net_etw.start()      # begin the ETW trace (needs admin)
         elif self._proc_mode == "net":
             self.net_etw.stop()           # stop tracing when leaving NET
+        frm = self._mode_index(self._proc_mode)
         self._proc_mode = mode
         self.cfg.set("proc_mode", mode)
         self.filter = ""
         self.search.delete(0, "end")
-        self._draw_seg()
+        self._anim_seg(frm, self._mode_index(mode))
         self._refresh_active_procs()
-        self.lbl_prochead.config(text=str(len(self._active_procs)))
+        self._update_prochead()
         self._draw_procs()
+
+    def _update_prochead(self):
+        """Count plus the mode's total — the bare number was a mystery. The
+        total is dropped rather than clipped if the header has no room."""
+        procs = self._active_procs
+        n = len(procs)
+        txt = str(n)
+        if procs:
+            tot = self._fmt_val(sum(v for _, v, _ in procs))
+            try:
+                room = (self._phead.winfo_width() - self._seg.winfo_width()
+                        - self._search_box.winfo_width() - 20)
+                for cand in ("{} · Σ {}".format(n, tot),
+                             "{} · {}".format(n, tot),
+                             "Σ {}".format(tot)):
+                    if self.f_cap.measure(cand) <= room:
+                        txt = cand
+                        break
+            except Exception:
+                pass
+        self.lbl_prochead.config(text=txt)
 
     def _refresh_active_procs(self):
         """Recompute the per-process list for the current mode (VRAM rows come
@@ -1768,11 +1932,16 @@ class App:
         cb += 58
         cb += 58 if self.show_cpu else 0
         cb += 40
+        old_minh = self._minh
         self._minh = cb + 84
         m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", self.root.geometry())
         if m and not self._maxed:
-            wd, _, x, yy = m.groups()
-            self.root.geometry(f"{wd}x{self._minh}+{x}+{yy}")
+            wd, ch, x, yy = m.groups()
+            # Grow/shrink by the DELTA so a user-resized window keeps its extra
+            # process rows instead of snapping back to the minimum height.
+            h = max(self._minh, min(int(ch) + (self._minh - old_minh),
+                                    self.root.winfo_screenheight()))
+            self.root.geometry(f"{wd}x{h}+{x}+{yy}")
         self._paint_cards()
 
     def _open_settings(self):
@@ -1913,6 +2082,10 @@ class App:
         apply_accent(name)
         self.cfg.set("accent", name)
         self._draw_search_box(self.search.focus_get() is self.search)
+        # Both are drawn once at construction, so nothing else ever heals them.
+        self._logo.itemconfig(self._logo_hi, fill=GPU_LINE)
+        self._logo.itemconfig(self._logo_lo, fill=ACCENT)
+        self._draw_seg()                  # the active pill is accent-filled
         self._paint_cards()
 
     def _open_log(self):
@@ -1990,7 +2163,7 @@ class App:
             f"{mix(h(hexcol, i), h(basehex, i)):02x}" for i in (1, 3, 5))
 
     def _card(self, c, x0, y0, x1, y1):
-        self._round_rect(c, x0, y0, x1, y1, 9, fill=PANEL, tags="fg")
+        return self._round_rect(c, x0, y0, x1, y1, 9, fill=PANEL, tags="fg")
 
     def _spark(self, c, data, x0, y0, x1, y1, color):
         if x1 - x0 < 4 or len(data) < 2:
@@ -2002,7 +2175,9 @@ class App:
         flat = [k for p in pts for k in p]
         c.create_polygon([x0, y1] + flat + [x1, y1],
                          fill=self._tint(color, PANEL), outline="", tags="fg")
-        c.create_line(flat, fill=color, width=1.5, smooth=True, tags="fg")
+        # no smooth=: spline smoothing clipped real peaks to ~75% and drew a
+        # line that disagreed with its own (unsmoothed) fill polygon
+        c.create_line(flat, fill=color, width=1.5, tags="fg")
 
     def _net_spark(self, c, x0, y0, x1, y1):
         """Download (filled accent) + upload (secondary line) on a shared,
@@ -2016,16 +2191,39 @@ class App:
             hh = y1 - y0
             pts = [k for i, v in enumerate(tn)
                    for k in (x0 + i * step, y1 - (hh - 2) * min(v, 100) / 100 - 1)]
-            c.create_line(pts, fill=GPU_LINE, width=1.5, smooth=True, tags="fg")
+            c.create_line(pts, fill=GPU_LINE, width=1.5, tags="fg")
 
-    def _mini(self, c, x0, y, x1, label, value, vcol=FG):
-        self._card(c, x0, y, x1, y + 50)
+    def _font_mid(self, fnt):
+        """(ascent-descent)/2 for baseline-aligned canvas text, cached — a
+        centre-anchored item sits at baseline - this."""
+        key = str(fnt)
+        v = self._fmet.get(key)
+        if v is None:
+            v = self._fmet[key] = (fnt.metrics("ascent")
+                                   - fnt.metrics("descent")) / 2
+        return v
+
+    def _bignum(self, c, x, baseline, value, unit, vfont, ufont, vcol=FG):
+        """Big value + small muted unit sharing one baseline — units whisper so
+        the number reads bigger at the same size."""
+        c.create_text(x, baseline - self._font_mid(vfont), text=value,
+                      anchor="w", fill=vcol, font=vfont, tags="fg")
+        if unit:
+            c.create_text(x + vfont.measure(value) + 5,
+                          baseline - self._font_mid(ufont), text=unit,
+                          anchor="w", fill=MUTED, font=ufont, tags="fg")
+
+    def _mini(self, c, x0, y, x1, label, value, vcol=FG, unit=""):
+        item = self._card(c, x0, y, x1, y + 50)
         c.create_text(x0 + 12, y + 15, text=label, anchor="w", fill=MUTED,
                       font=self.f_cap, tags="fg")
-        c.create_text(x0 + 12, y + 35, text=value, anchor="w", fill=vcol,
-                      font=self.f_stat, tags="fg")
+        self._bignum(c, x0 + 12, y + 40, value, unit, self.f_stat, self.f_cap,
+                     vcol)
+        return item
 
     def _paint_cards(self):
+        if self._resize_after is not None:
+            self.root.after_cancel(self._resize_after)   # else a 2nd chain runs
         self._resize_after = None
         self._last_paint = time.monotonic()
         c = self.cards
@@ -2033,6 +2231,7 @@ class App:
         if w <= 1:
             w = 300
         c.delete("fg")
+        self._card_regions = []
         d = self.last or {}
         used = d.get("dedicated", 0)
         pct = (used / self.total * 100) if self.total else 0
@@ -2046,31 +2245,34 @@ class App:
         gap = 10
         midx = (x0 + x1) / 2
 
-        c.create_text(x0 + 2, 14, text=self.gpu_name, anchor="w", fill=FG,
-                      font=self.f_titlebar, tags="fg")
+        # identity text stays quiet — the live numbers own the first glance
+        c.create_text(x0 + 2, 14, text=self.gpu_name.upper(), anchor="w",
+                      fill=MUTED, font=self.f_cap, tags="fg")
 
         # --- VRAM card ---
         y = 30
         y1 = y + 112
-        self._card(c, x0, y, x1, y1)
+        self._card_regions.append(
+            (x0, y, x1, y1, "vram", self._card(c, x0, y, x1, y1)))
         c.create_text(x0 + 12, y + 17, text="VRAM", anchor="w", fill=MUTED,
                       font=self.f_cap, tags="fg")
         c.create_text(x1 - 12, y + 16, text=f"{pct:.0f}%", anchor="e",
-                      fill=col, font=self.f_stat, tags="fg")
+                      fill=state_color(pct), font=self.f_stat, tags="fg")
         if self._peak:
-            c.create_text(x1 - 12, y + 33, text=f"peak {fmt_gb(self._peak)}",
+            c.create_text(x1 - 12, y + 33, text=f"peak {fmt_gb(self._peak)} GB",
                           anchor="e", fill=MUTED, font=self.f_cap, tags="fg")
-        c.create_text(x0 + 12, y + 47, text=fmt_gb(used), anchor="w", fill=FG,
-                      font=self.f_cardnum, tags="fg")
-        nwm = self.f_cardnum.measure(fmt_gb(used))
-        c.create_text(x0 + 12 + nwm + 6, y + 53,
-                      text=f"/ {fmt_gb(self.total)} GB", anchor="w",
-                      fill=MUTED, font=self.f_small, tags="fg")
+        self._bignum(c, x0 + 12, y + 56, fmt_gb(used),
+                     f"/ {fmt_gb(self.total)} GB", self.f_cardnum,
+                     self.f_small)
         bx0, bx1, by = x0 + 12, x1 - 12, y + 66
         self._round_rect(c, bx0, by, bx1, by + 7, 3, fill=TRACK, tags="fg")
         fw = (bx1 - bx0) * min(pct, 100) / 100
         if fw > 3:
             self._round_rect(c, bx0, by, bx0 + fw, by + 7, 3, fill=col, tags="fg")
+        if self._peak and self.total:    # ghost tick = the session high-water
+            tx = bx0 + (bx1 - bx0) * min(self._peak / self.total, 1.0)
+            c.create_line(tx, by - 2, tx, by + 9, width=2,
+                          fill=self._tint(ACCENT_WARN, PANEL), tags="fg")
         self._spark(c, list(self.hist_vram), bx0, y + 82, bx1, y1 - 8, ACCENT)
         y = y1 + gap
 
@@ -2079,8 +2281,8 @@ class App:
         self._card(c, x0, y, x1, y1)
         c.create_text(x0 + 12, y + 17, text="GPU LOAD", anchor="w", fill=MUTED,
                       font=self.f_cap, tags="fg")
-        c.create_text(x0 + 12, y + 45, text=f"{gpu:.0f}%", anchor="w",
-                      fill=usage_color(gpu), font=self.f_cardnum, tags="fg")
+        self._bignum(c, x0 + 12, y + 54, f"{gpu:.0f}", "%", self.f_cardnum,
+                     self.f_small, state_color(gpu, 85, 97))
         if "power" in s:
             c.create_text(x1 - 12, y + 20, text=f"{s['power']:.0f} W",
                           anchor="e", fill=MUTED, font=self.f_stat, tags="fg")
@@ -2089,8 +2291,8 @@ class App:
                  ("Video", "Vid"), ("Copy", "Cpy"), ("Compute", "Cmp")]
         parts = [f"{lab} {eng[k]:.0f}" for k, lab in order
                  if k in eng and eng[k] >= 1]
-        c.create_text(x1 - 12, y + 47, text="  ".join(parts[:4]) or "idle",
-                      anchor="e", fill=MUTED, font=self.f_small, tags="fg")
+        c.create_text(x1 - 12, y + 34, text="  ".join(parts[:4]) or "idle",
+                      anchor="e", fill=MUTED, font=self.f_cap, tags="fg")
         self._spark(c, list(self.hist_gpu), x0 + 12, y + 60, x1 - 12, y1 - 8,
                     GPU_LINE)
         y = y1 + gap
@@ -2103,17 +2305,22 @@ class App:
                           fill=MUTED, font=self.f_cap, tags="fg")
             temp = s.get("temp")
             if temp is not None:
-                tcol = (ACCENT if temp < 75 else
-                        ACCENT_WARN if temp < 85 else ACCENT_HOT)
-                c.create_text(x0 + 12, y + 47, text=f"{temp:.0f}°C", anchor="w",
-                              fill=tcol, font=self.f_cardnum, tags="fg")
-            extra = []
+                self._bignum(c, x0 + 12, y + 56, f"{temp:.0f}", "°C",
+                             self.f_cardnum, self.f_small, temp_color(temp))
+            # hotspot is the number that actually throttles an RDNA card, so
+            # it takes the companion slot (value + own thresholds) and the
+            # vram temp drops to the muted detail line, like VRAM's "peak".
+            det = []
             if "hotspot" in s:
-                extra.append(f"hotspot {s['hotspot']:.0f}°")
+                c.create_text(x1 - 12, y + 16, text=f"{s['hotspot']:.0f}°",
+                              anchor="e", fill=temp_color(s["hotspot"], 90, 100),
+                              font=self.f_stat, tags="fg")
+                det.append("hotspot")
             if "vramtemp" in s:
-                extra.append(f"vram {s['vramtemp']:.0f}°")
-            c.create_text(x1 - 12, y + 22, text="   ".join(extra), anchor="e",
-                          fill=MUTED, font=self.f_small, tags="fg")
+                det.append(f"vram {s['vramtemp']:.0f}°")
+            if det:
+                c.create_text(x1 - 12, y + 33, text="  ·  ".join(det), anchor="e",
+                              fill=MUTED, font=self.f_cap, tags="fg")
             clk = []
             if "coreclk" in s:
                 clk.append(f"{s['coreclk']:.0f} core")
@@ -2124,34 +2331,59 @@ class App:
             c.create_text(x0 + 12, y + 68, text="  ·  ".join(clk), anchor="w",
                           fill=MUTED, font=self.f_small, tags="fg")
             self._spark(c, list(self.hist_temp), x0 + 12, y + 78, x1 - 12,
-                        y1 - 8, ACCENT_WARN)
+                        y1 - 8, GPU_LINE)
             y = y1 + gap
 
         # --- NETWORK card (total throughput, down + up) ---
         if self.show_net:
             y1 = y + 86
-            self._card(c, x0, y, x1, y1)
+            self._card_regions.append(
+                (x0, y, x1, y1, "net", self._card(c, x0, y, x1, y1)))
             c.create_text(x0 + 12, y + 17, text="NETWORK", anchor="w",
                           fill=MUTED, font=self.f_cap, tags="fg")
-            c.create_text(x0 + 12, y + 45, text=f"↓ {fmt_bits(self.net_rx)}",
-                          anchor="w", fill=ACCENT, font=self.f_stat, tags="fg")
-            c.create_text(x1 - 12, y + 45, text=f"↑ {fmt_bits(self.net_tx)}",
-                          anchor="e", fill=GPU_LINE, font=self.f_stat, tags="fg")
-            self._net_spark(c, x0 + 12, y + 58, x1 - 12, y1 - 8)
+            base, aw = y + 50, self.f_small.measure("↓") + 6
+            ay = base - self._font_mid(self.f_small)
+            dn, dnu = split_bits(self.net_rx)
+            c.create_text(x0 + 12, ay, text="↓", anchor="w", fill=MUTED,
+                          font=self.f_small, tags="fg")
+            self._bignum(c, x0 + 12 + aw, base, dn, dnu, self.f_pct,
+                         self.f_small, ACCENT)
+            up, upu = split_bits(self.net_tx)
+            uw = (aw + self.f_pct.measure(up) + 5 + self.f_small.measure(upu))
+            ux = x1 - 12 - uw
+            c.create_text(ux, ay, text="↑", anchor="w", fill=MUTED,
+                          font=self.f_small, tags="fg")
+            self._bignum(c, ux + aw, base, up, upu, self.f_pct,
+                         self.f_small, GPU_LINE)
+            self._net_spark(c, x0 + 12, y + 60, x1 - 12, y1 - 8)
             y = y1 + gap
 
         # --- FREE / SHARED (+ CPU / RAM) mini-cards ---
-        self._mini(c, x0, y, midx - gap / 2, "FREE", f"{fmt_gb(free)} GB")
-        self._mini(c, midx + gap / 2, y, x1, "SHARED", f"{fmt_gb(shared)} GB")
+        self._mini(c, x0, y, midx - gap / 2, "FREE", fmt_gb(free), unit="GB")
+        self._mini(c, midx + gap / 2, y, x1, "SHARED", fmt_gb(shared),
+                   unit="GB")
         y += 50 + 8
         if self.show_cpu:
             ramp, ramu, ramt = self.ram
-            self._mini(c, x0, y, midx - gap / 2, "CPU", f"{self.cpu:.0f}%",
-                       usage_color(self.cpu))
-            self._mini(c, midx + gap / 2, y, x1, "RAM",
-                       f"{gb(ramu):.1f} / {gb(ramt):.0f} GB" if ramt else "—",
-                       usage_color(ramp))
+            self._card_regions.append((
+                x0, y, midx - gap / 2, y + 50, "cpu",
+                self._mini(c, x0, y, midx - gap / 2, "CPU", f"{self.cpu:.0f}",
+                           state_color(self.cpu), unit="%")))
+            # only the live number carries state colour — capacity is static
+            self._card_regions.append((
+                midx + gap / 2, y, x1, y + 50, "ram",
+                self._mini(c, midx + gap / 2, y, x1, "RAM",
+                           f"{gb(ramu):.1f}" if ramt else "—",
+                           state_color(ramp) if ramt else FG,
+                           unit=f"/ {gb(ramt):.0f} GB" if ramt else "")))
             y += 50 + 8
+
+        # the card polys are recreated each paint, so re-apply the hover tint
+        if self._card_hover:
+            for _x0, _y0, _x1, _y1, m, item in self._card_regions:
+                if m == self._card_hover:
+                    c.itemconfig(item, fill=PANEL_HOVER)
+                    break
 
         # --- driver-cached / leak-watch note ---
         cached = used - d.get("tracked", 0)
@@ -2187,23 +2419,41 @@ class App:
         valid = 0 <= i < len(self._proc_list)
         over_x = valid and e.x >= w - 26 and not self._proc_list[i][3]
         self.plist.config(cursor="hand2" if over_x else "")
-        self._plist_hover(i if valid else -1)          # highlight the whole row
+        self._plist_hover(i if valid else -1, over_x)  # highlight the whole row
 
-    def _plist_hover(self, i):
+    def _row_idle(self, val):
+        """True when a rate-mode row renders as zero — those rows recede to
+        grey so the real movers own the list. The thresholds mirror _fmt_val
+        exactly; fmt_bits prints exact bps, so only a true 0 is idle there."""
+        m = self._proc_mode
+        return ((m == "cpu" and val < 0.5) or          # prints "0%"
+                (m == "disk" and val < 5e4) or         # prints "0.0 MB/s"
+                (m == "net" and val <= 0))
+
+    def _xcol(self, i, over_x=False):
+        """✕ colour must be earned: red only under the cursor, muted at rest,
+        grey on idle rows, lock-grey on critical rows."""
+        name, val, pids, crit = self._proc_list[i]
+        if crit:
+            return GRID
+        if i == self._hover_i:
+            return ACCENT_HOT2 if over_x else ACCENT_HOT
+        return GRID if self._row_idle(val) else MUTED
+
+    def _plist_hover(self, i, over_x=False):
         # Update just the hover highlight + the two affected ✕ marks — a full
         # _draw_procs() here cost ~14 ms per row-crossing on a long list.
-        if i == self._hover_i:
+        if i == self._hover_i and over_x == self._hover_xf:
             return
-        prev, self._hover_i = self._hover_i, i
+        prev = self._hover_i
+        self._hover_i, self._hover_xf = i, over_x
         c = self.plist
         for idx in (prev, i):
             xi = self._xitems.get(idx)
             if xi is not None and 0 <= idx < len(self._proc_list):
-                crit = self._proc_list[idx][3]
-                c.itemconfig(xi, fill=(
-                    GRID if crit else
-                    ACCENT_HOT2 if idx == self._hover_i else ACCENT_HOT))
-        self._draw_hover_hl()
+                c.itemconfig(xi, fill=self._xcol(idx, over_x))
+        if prev != i:
+            self._draw_hover_hl()
 
     def _draw_hover_hl(self):
         """Task-Manager-style highlight behind the hovered row."""
@@ -2326,13 +2576,15 @@ class App:
         for i in range(first, last):
             name, val, pids = procs[i]
             crit = self._proc_list[i][3]
+            idle = self._row_idle(val)
             y = i * rh + rh / 2
             if self._show_growth and name in self._growing:
                 c.create_text(4, y, text="↑", anchor="w", fill=ACCENT_WARN,
                               font=self.f_mid, tags="row")
-            c.create_text(18, y, text=name[:22], anchor="w", fill=FG,
+            c.create_text(18, y, text=name[:22], anchor="w",
+                          fill=MUTED if idle else FG,
                           font=self.f_mid, tags="row")
-            if bx1 > bx0:
+            if bx1 > bx0 and not idle:     # idle rows drop the bar entirely
                 self._round_rect(c, bx0, y - 3, bx1, y + 3, 3, fill=TRACK,
                                  outline="", tags="row")
                 fw = (bx1 - bx0) * val / maxv
@@ -2340,11 +2592,13 @@ class App:
                     self._round_rect(c, bx0, y - 3, bx0 + fw, y + 3, 3,
                                      fill=ACCENT, outline="", tags="row")
             c.create_text(mbx, y, text=self._fmt_val(val), anchor="e",
-                          fill=MUTED, font=self.f_mono, tags="row")
-            xcol = (GRID if crit else
-                    ACCENT_HOT2 if i == self._hover_i else ACCENT_HOT)
-            self._xitems[i] = c.create_text(xx, y, text="✕", anchor="e",
-                                            fill=xcol, font=self.f_mid, tags="row")
+                          fill=GRID if idle else MUTED, font=self.f_mono,
+                          tags="row")
+            # critical rows show a lock, not a kill mark — they can't be ended
+            self._xitems[i] = c.create_text(
+                xx, y, text=chr(0xE72E) if crit else "✕", anchor="e",
+                fill=self._xcol(i, self._hover_xf),
+                font=self.f_icon if crit else self.f_mid, tags="row")
         self._draw_hover_hl()
 
     # -- ending a process -------------------------------------------------- #
@@ -2486,7 +2740,7 @@ class App:
         if self._ever_visible and not vis:
             return                        # minimised / hidden — skip the repaint
         self._refresh_active_procs()
-        self.lbl_prochead.config(text=str(len(self._active_procs)))
+        self._update_prochead()
         self._paint_cards()
         self._draw_procs()
 
@@ -2568,7 +2822,9 @@ class App:
         except Exception:
             pass
 
-    def _toast(self, text, color=ACCENT_WARN):
+    def _toast(self, text, color=None):
+        # default resolved at call time — ACCENT_WARN is theme-dependent now
+        color = color or ACCENT_WARN
         try:
             t = tk.Toplevel(self.root)
             t.overrideredirect(True)

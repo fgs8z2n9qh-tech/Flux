@@ -36,12 +36,16 @@ pythonnet or the DLLs are missing the app just hides the temp card and runs fine
 A frameless, custom-chrome window (drag the title bar; pin / minimise / maximise
 / close are in-app) with metric cards on the left and processes on the right:
 
+- **Click any metric card** to jump the process list to that view — the VRAM,
+  NETWORK, CPU and RAM cards are shortcuts to their per-process breakdown.
 - **VRAM card** — dedicated VRAM in use vs. true card capacity, a % that turns
-  amber at 70% / red at 90%, a usage bar, a sparkline, and the **session peak**.
+  amber at 70% / red at 90%, a usage bar, a sparkline, and a ghost tick on the
+  bar marking the **session peak**.
 - **GPU load card** — live **GPU utilization %**, **power draw (W)**, the busiest
   **engines** (3D / Video / Copy / Compute), and a sparkline.
-- **GPU temp card** — core temp (colour-coded), hot-spot and VRAM temps, core /
-  memory clocks, fan rpm, and a temperature trend sparkline.
+- **GPU temp card** — core temp and **hot-spot** (the number that actually
+  throttles the card, so it gets its own thresholds), VRAM temp, core / memory
+  clocks, fan rpm, and a temperature trend sparkline.
 - **Network card** — total download / upload throughput with a dual-line trend
   graph, read off the busiest real interface so VPN / Hyper-V / WSL adapters
   don't double-count. No admin (per-process network would need ETW).
@@ -58,16 +62,22 @@ A frameless, custom-chrome window (drag the title bar; pin / minimise / maximise
   with a mini-bar, value, and a red **✕** to end the process (confirmation + a
   live identity re-check so PID reuse can't make you kill the wrong/critical
   process). An amber **↑** flags processes whose VRAM keeps climbing — the live
-  leak hunter (VRAM view). The **NET** view is the one feature that needs
+  leak hunter (VRAM view). The header shows the process count **and the
+  current view's total** (e.g. `133 · 12.5 GB`). The **NET** view is the one feature that needs
   administrator rights (per-process network comes from an ETW kernel trace);
   without them it offers a one-click *restart elevated*. Everything else,
   including the total-throughput Network card, runs with no admin.
 - **Threshold alert** — a corner toast + beep when VRAM crosses the threshold.
+- **Colour is earned** — a value is white while it is healthy and only turns
+  amber/red when something is actually wrong, so a coloured number always means
+  "look at this". Idle processes recede to grey, and processes that can't be
+  ended show a lock instead of a ✕. Six accent themes, each with warning
+  colours that can't collide with the accent.
 
 ### Leak hunting
 
 - **Background log** — appends a snapshot (VRAM, %, cached, GPU%, temp, top-5
-  processes) to `flux_log.csv` next to the app every minute.
+  processes) to `flux_log.csv` in `%LOCALAPPDATA%\Flux` every minute.
 - **Auto-snapshot** — when VRAM suddenly jumps, the full process list is dumped
   to `flux_snapshot_<time>.txt` to catch the culprit in the act.
 - **Log viewer** — the history button (top bar) opens an in-app report: peak,
@@ -112,5 +122,7 @@ python -m PyInstaller --onefile --windowed --name Flux --icon Flux.ico `
 | Ending a process | `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`, with a live name/critical re-check first |
 | Temp / clocks / power / fan | LibreHardwareMonitor via `pythonnet` (AMD GPU sensors, no admin) |
 
-The core is all in-process via `ctypes` — no subprocesses. Only the optional
-temperature card pulls in pythonnet + the LibreHardwareMonitor DLLs.
+The measurement core is all in-process via `ctypes`. The optional temperature
+card is the one exception: it runs LibreHardwareMonitor in an isolated **child
+process**, because a native fault inside a sensor sweep is uncatchable and would
+otherwise take the whole monitor down with it.
